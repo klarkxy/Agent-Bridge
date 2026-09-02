@@ -179,6 +179,8 @@ class Task(BaseModel):
     requested_model: str | None = None
     requested_effort: str | None = None
     request_id: str | None = None
+    requested_session_id: str | None = None
+    requested_title: str | None = None
     task_key: str | None = None
     task_mode: str | None = None
     write_paths: list[str] = Field(default_factory=list)

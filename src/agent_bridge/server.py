@@ -45,7 +45,8 @@ INSTRUCTIONS = (
     "but descendants must not receive or call Bridge, own Git state, or accept "
     "results. dispatch_task.cwd is the coordinator's absolute workspace; Bridge never "
     "creates or merges worktrees. Pass request_id, task_key, task_mode, "
-    "write_paths, workspace_mode, and base_revision as attribution metadata. "
+    "write_paths, workspace_mode, and base_revision as attribution metadata. Reuse "
+    "the same request_id after a lost response so Bridge does not start the turn twice. "
     "A wait_task "
     "timeout is not failure; call it again. Verify results with get_result plus "
     "your own git diff — do not trust a worker's self-report. An empty Kimi "
@@ -131,7 +132,7 @@ async def dispatch_task(
     workspace_mode: str | None = None,
     base_revision: str | None = None,
 ) -> dict[str, Any]:
-    """Start one already-defined external TaskNode turn. cwd is the absolute coordinator-owned workspace; Bridge never creates or merges worktrees. Optional request_id/task_key/task_mode/write_paths/workspace_mode/base_revision are attribution metadata, not an OS sandbox. Pass session_id only to continue in the same cwd. Set user_requested=true only when the user explicitly asked for a worker (required in manual mode). Rejected when coordinator.dispatch_enabled is false. Returns immediately."""
+    """Start one already-defined external TaskNode turn. cwd is the absolute coordinator-owned workspace; Bridge never creates or merges worktrees. Optional request_id/task_key/task_mode/write_paths/workspace_mode/base_revision are attribution metadata, not an OS sandbox. Reusing a recent request_id with the same payload returns the existing task; a conflicting payload is rejected. This prevents duplicate Bridge tasks, not exactly-once worker side effects. Pass session_id only to continue in the same cwd. Set user_requested=true only when the user explicitly asked for a worker (required in manual mode). Rejected when coordinator.dispatch_enabled is false. Returns immediately."""
     try:
         result = await _registry(ctx).dispatch_task(
             agent=agent,

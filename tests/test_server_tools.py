@@ -26,6 +26,7 @@ def test_handshake_instructions_carry_hard_rules():
         "dispatch_enabled",
         "runtime_context",
         "request_id",
+        "does not start the turn twice",
         "write_paths",
         "never creates or merges worktrees",
         "Provider-native subagents may work",

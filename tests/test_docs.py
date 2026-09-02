@@ -122,6 +122,10 @@ def test_orchestration_keeps_worker_loop_rules_in_both_languages():
     assert "超时" in zh
     assert "same `session_id`" in en
     assert "同一个 `session_id`" in zh
+    assert "reused=true" in en
+    assert "reused=true" in zh
+    assert "not exactly-once" in en
+    assert "不保证 Worker 的外部副作用 exactly-once" in zh
     assert "one evidence-driven focused retry" in en
     assert "一次基于证据的聚焦重试" in zh
     assert "Provider-native subagents remain available" in en

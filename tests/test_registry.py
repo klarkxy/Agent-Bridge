@@ -107,6 +107,136 @@ async def test_dispatch_roundtrips_tasknode_metadata_and_reuses_request_id(
 
 
 @pytest.mark.asyncio
+async def test_request_id_replay_survives_restart(bridge_home, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    request_id = "b2349f1d-c418-4bbb-a334-3f1595ab6f79"
+    kwargs = {
+        "request_id": request_id,
+        "task_key": "drill/restart",
+        "task_mode": "write",
+        "write_paths": ["owned.txt"],
+        "workspace_mode": "worktree",
+        "base_revision": "base-1",
+    }
+
+    first_registry = Registry.create(bridge_home)
+    await first_registry.start()
+    first = await first_registry.dispatch_task(
+        "fake", "write once", cwd=str(work.resolve()), **kwargs
+    )
+    first_result = await first_registry.wait_task(first["task_id"], timeout_sec=5)
+    await first_registry.stop()
+
+    restarted = Registry.create(bridge_home)
+    await restarted.start()
+    try:
+        replay = await restarted.dispatch_task(
+            "fake", "write once", cwd=str(work.resolve()), **kwargs
+        )
+        assert replay["reused"] is True
+        assert replay["task_id"] == first["task_id"]
+        result = await restarted.wait_task(first["task_id"], timeout_sec=0.1)
+        assert result["result_text"] == first_result["result_text"]
+    finally:
+        await restarted.stop()
+
+
+@pytest.mark.asyncio
+async def test_claimed_request_is_not_restarted_after_owner_crash(
+    bridge_home, tmp_path, monkeypatch
+):
+    monkeypatch.setattr("agent_bridge.registry.owner_alive", lambda pid, create_time: False)
+    work = tmp_path / "work"
+    work.mkdir()
+    cwd = str(work.resolve())
+    request_id = "c4522661-3287-432c-bd4f-bdfb7de72c98"
+    session = Session(
+        session_id="sess_claimed",
+        agent="fake",
+        cwd=cwd,
+        proc_state=ProcState.spawning,
+        owner_pid=9999,
+        owner_create_time=1.0,
+    )
+    task = Task(
+        task_id="task_claimed",
+        session_id=session.session_id,
+        agent="fake",
+        message="write once",
+        cwd=cwd,
+        request_id=request_id,
+        status=TaskStatus.queued,
+        owner_pid=9999,
+        owner_create_time=1.0,
+    )
+    atomic_write_json(
+        state_path(bridge_home),
+        {
+            "sessions": [session.model_dump(mode="json")],
+            "tasks": [task.model_dump(mode="json")],
+        },
+    )
+
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    try:
+        replay = await registry.dispatch_task(
+            "fake", "write once", cwd=cwd, request_id=request_id
+        )
+        assert replay["reused"] is True
+        assert replay["task_id"] == task.task_id
+        assert replay["status"] == "failed"
+        assert registry.tasks[task.task_id].error == "bridge_restarted"
+        assert registry._bg == {}
+    finally:
+        await registry.stop()
+
+
+@pytest.mark.asyncio
+async def test_request_id_is_claimed_once_across_live_instances(
+    bridge_home, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("AGENT_BRIDGE_FAKE_DELAY", "0.2")
+    monkeypatch.setattr("agent_bridge.registry.owner_alive", lambda pid, create_time: True)
+    work = tmp_path / "work"
+    work.mkdir()
+    cwd = str(work.resolve())
+    kwargs = {
+        "request_id": "8eb071d4-ed77-49d7-b592-8967b5052f1e",
+        "task_key": "drill/live-instances",
+        "task_mode": "write",
+        "write_paths": ["shared.txt"],
+        "workspace_mode": "shared",
+        "base_revision": "base-1",
+    }
+    a = Registry.create(bridge_home, owner_pid=1001, owner_create_time=11.0)
+    b = Registry.create(bridge_home, owner_pid=2002, owner_create_time=22.0)
+    await a.start()
+    await b.start()
+    try:
+        first, second = await asyncio.gather(
+            a.dispatch_task("fake", "shared", cwd=cwd, **kwargs),
+            b.dispatch_task("fake", "shared", cwd=cwd, **kwargs),
+        )
+        assert first["task_id"] == second["task_id"]
+        assert {first["reused"], second["reused"]} == {False, True}
+        owners = [registry for registry in (a, b) if first["task_id"] in registry.tasks]
+        assert len(owners) == 1
+        reader = b if owners[0] is a else a
+        result = await reader.wait_task(first["task_id"], timeout_sec=5)
+        assert result["status"] == "completed"
+        assert result["task_key"] == "drill/live-instances"
+        assert reader.get_result(first["task_id"])["status"] == "completed"
+        assert reader.get_transcript(first["session_id"])["count"] >= 1
+        with pytest.raises(RuntimeError, match="another Bridge instance"):
+            await reader.cancel_task(first["task_id"])
+    finally:
+        await b.stop()
+        await a.stop()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
@@ -135,15 +265,6 @@ async def test_dispatch_rejects_invalid_tasknode_metadata(
             )
     finally:
         await registry.stop()
-
-
-def test_session_scope_is_explicit(bridge_home, monkeypatch):
-    registry = Registry.create(bridge_home)
-    monkeypatch.setattr("agent_bridge.registry.count_sibling_servers", lambda: 3)
-    assert registry.session_scope() == {
-        "scope": "current_instance",
-        "other_live_instances": 3,
-    }
 
 
 @pytest.mark.asyncio
@@ -702,72 +823,101 @@ async def test_old_terminal_tasks_are_pruned(bridge_home, tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_request_id_replay_survives_task_pruning_and_restart(
-    bridge_home, tmp_path, monkeypatch
+async def test_legacy_request_tombstone_migrates_into_bounded_task_history(
+    bridge_home, tmp_path
 ):
-    monkeypatch.setattr("agent_bridge.registry.TASK_KEEP_PER_SESSION", 1)
     work = tmp_path / "work"
     work.mkdir()
-    request_id = "b2349f1d-c418-4bbb-a334-3f1595ab6f79"
-    kwargs = {
-        "request_id": request_id,
-        "task_key": "drill/durable-idempotency",
-        "task_mode": "write",
-        "write_paths": ["owned.txt"],
-        "workspace_mode": "worktree",
-        "base_revision": "base-1",
-    }
+    cwd = str(work.resolve())
+    request_id = "db7abbb3-10fc-4316-a0b5-c94d10f42ae7"
+    session = Session(session_id="sess_legacy", agent="fake", cwd=cwd)
+    task = Task(
+        task_id="task_legacy",
+        session_id=session.session_id,
+        agent="fake",
+        message="legacy",
+        cwd=cwd,
+        request_id=request_id,
+        task_key="drill/legacy",
+        task_mode="write",
+        write_paths=["owned.txt"],
+        workspace_mode="worktree",
+        base_revision="base-1",
+        status=TaskStatus.completed,
+        result_text="legacy result",
+    )
+    atomic_write_json(
+        state_path(bridge_home),
+        {
+            "sessions": [session.model_dump(mode="json")],
+            "tasks": [],
+            "request_tombstones": [task.model_dump(mode="json")],
+        },
+    )
 
     registry = Registry.create(bridge_home)
     await registry.start()
     try:
-        first = await registry.dispatch_task(
-            "fake", "write once", cwd=str(work.resolve()), **kwargs
-        )
-        first_result = await registry.wait_task(first["task_id"], timeout_sec=5)
-        for index in range(2):
-            more = await registry.dispatch_task(
-                "fake",
-                f"other-{index}",
-                cwd=str(work.resolve()),
-                session_id=first["session_id"],
-            )
-            await registry.wait_task(more["task_id"], timeout_sec=5)
-
-        assert first["task_id"] not in registry.tasks
-        assert (
-            registry.request_tombstones[request_id].result_text
-            == first_result["result_text"]
-        )
         replay = await registry.dispatch_task(
-            "fake", "write once", cwd=str(work.resolve()), **kwargs
+            "fake",
+            "legacy",
+            cwd=cwd,
+            request_id=request_id,
+            task_key="drill/legacy",
+            task_mode="write",
+            write_paths=["owned.txt"],
+            workspace_mode="worktree",
+            base_revision="base-1",
         )
         assert replay["reused"] is True
-        assert replay["task_id"] == first["task_id"]
-        assert (
-            registry.get_result(first["task_id"])["result_text"]
-            == first_result["result_text"]
-        )
+        assert replay["task_id"] == task.task_id
+        assert registry.get_result(task.task_id)["result_text"] == "legacy result"
+        assert "request_tombstones" not in read_json(state_path(bridge_home), {})
     finally:
         await registry.stop()
 
-    restarted = Registry.create(bridge_home)
-    await restarted.start()
+
+@pytest.mark.asyncio
+async def test_request_id_expires_with_existing_task_retention(
+    bridge_home, tmp_path, monkeypatch
+):
+    monkeypatch.setattr("agent_bridge.registry.TASK_KEEP_PER_SESSION", 2)
+    work = tmp_path / "work"
+    work.mkdir()
+    request_ids = [
+        "d39577c4-af2b-47de-a75b-ea9220d62739",
+        "eaa93452-c923-45ea-ab0a-53f300129691",
+        "2e8e360c-fb6c-4d64-9ec0-7b5846cab371",
+        "45dc6668-7ac7-4440-88c7-ec02c11eb993",
+    ]
+    registry = Registry.create(bridge_home)
+    await registry.start()
     try:
-        replay = await restarted.dispatch_task(
-            "fake", "write once", cwd=str(work.resolve()), **kwargs
-        )
-        assert replay["reused"] is True
-        assert replay["task_id"] == first["task_id"]
-        assert (
-            await restarted.wait_task(first["task_id"], timeout_sec=0.1)
-        )["timed_out"] is False
-        with pytest.raises(ValueError, match="already bound"):
-            await restarted.dispatch_task(
-                "fake", "different payload", cwd=str(work.resolve()), **kwargs
+        dispatched = []
+        for index, request_id in enumerate(request_ids):
+            task = await registry.dispatch_task(
+                "fake",
+                f"task-{index}",
+                cwd=str(work.resolve()),
+                session_id=dispatched[0]["session_id"] if dispatched else None,
+                request_id=request_id,
+                task_key=f"drill/retention-{index}",
             )
+            await registry.wait_task(task["task_id"], timeout_sec=5)
+            dispatched.append(task)
+
+        assert dispatched[0]["task_id"] not in registry.tasks
+        replay = await registry.dispatch_task(
+            "fake",
+            "task-0",
+            cwd=str(work.resolve()),
+            request_id=request_ids[0],
+            task_key="drill/retention-0",
+        )
+        assert replay["reused"] is False
+        assert replay["task_id"] != dispatched[0]["task_id"]
     finally:
-        await restarted.stop()
+        await registry.stop()
 
 
 @pytest.mark.asyncio
