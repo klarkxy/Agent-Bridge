@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import re
+import uuid
 from datetime import datetime, timezone
 from enum import StrEnum
+from pathlib import PurePosixPath
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -34,6 +37,9 @@ class ProcState(StrEnum):
 TERMINAL_STATUSES = {TaskStatus.completed, TaskStatus.failed, TaskStatus.cancelled}
 DEFAULT_WAIT_SEC = 180.0
 EFFORTS = ("off", "low", "medium", "high", "max")
+WORKSPACE_MODES = ("shared", "patch_only", "worktree")
+_TASK_KEY = re.compile(r"^[a-z0-9][a-z0-9._/-]{0,127}$")
+_WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:")
 
 
 def normalize_effort(raw: str | None) -> str | None:
@@ -45,6 +51,66 @@ def normalize_effort(raw: str | None) -> str | None:
     if value not in EFFORTS:
         raise ValueError(f"effort must be one of off, low, medium, high, max (got {raw!r})")
     return value
+
+
+def normalize_request_id(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    try:
+        return str(uuid.UUID(raw.strip()))
+    except (AttributeError, ValueError) as exc:
+        raise ValueError("request_id must be a UUID") from exc
+
+
+def normalize_task_key(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if not _TASK_KEY.fullmatch(value):
+        raise ValueError(
+            "task_key must be 1-128 lowercase letters, digits, dots, slashes, underscores, or hyphens"
+        )
+    return value
+
+
+def normalize_task_mode(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if not value:
+        raise ValueError("task_mode must not be empty")
+    return value
+
+
+def normalize_workspace_mode(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    value = raw.strip().lower().replace("-", "_")
+    if value not in WORKSPACE_MODES:
+        raise ValueError(f"workspace_mode must be one of {', '.join(WORKSPACE_MODES)}")
+    return value
+
+
+def normalize_write_paths(raw: list[str] | None) -> list[str]:
+    if not raw:
+        return []
+    normalized: list[str] = []
+    for item in raw:
+        value = str(item).strip().replace("\\", "/")
+        path = PurePosixPath(value)
+        if (
+            not value
+            or path.is_absolute()
+            or _WINDOWS_DRIVE_PATH.match(value)
+            or any(part in {"", ".", ".."} for part in path.parts)
+        ):
+            raise ValueError(f"write_paths entries must be workspace-relative paths (got {item!r})")
+        rendered = path.as_posix()
+        if rendered in {"", "."}:
+            raise ValueError(f"write_paths entries must be workspace-relative paths (got {item!r})")
+        if rendered not in normalized:
+            normalized.append(rendered)
+    return normalized
 
 
 def agy_effort(effort: str | None) -> str | None:
@@ -110,6 +176,14 @@ class Task(BaseModel):
     cwd: str
     model: str | None = None
     effort: str | None = None
+    requested_model: str | None = None
+    requested_effort: str | None = None
+    request_id: str | None = None
+    task_key: str | None = None
+    task_mode: str | None = None
+    write_paths: list[str] = Field(default_factory=list)
+    workspace_mode: str | None = None
+    base_revision: str | None = None
     observed_model: str | None = None
     observed_effort: str | None = None
     status: TaskStatus = TaskStatus.queued

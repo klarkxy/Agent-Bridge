@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -57,6 +59,148 @@ def test_session_scope_is_explicit(bridge_home, monkeypatch):
         "scope": "current_instance",
         "other_live_instances": 3,
     }
+
+
+@pytest.mark.asyncio
+async def test_dispatch_roundtrips_tasknode_metadata_and_reuses_request_id(
+    bridge_home, tmp_path
+):
+    work = tmp_path / "work"
+    work.mkdir()
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    request_id = "6e348b4a-3cd2-4a94-84b6-ff53007eea9e"
+    kwargs = {
+        "request_id": request_id,
+        "task_key": "Bridge/Leaf_1",
+        "task_mode": "WRITE",
+        "write_paths": [r"src\one.py", "tests/**", "src/one.py"],
+        "workspace_mode": "patch-only",
+        "base_revision": "abc123",
+    }
+    try:
+        dispatched = await registry.dispatch_task(
+            "fake", "build foo", cwd=str(work.resolve()), **kwargs
+        )
+        assert dispatched["request_id"] == request_id
+        assert dispatched["task_key"] == "bridge/leaf_1"
+        assert dispatched["reused"] is False
+
+        reused = await registry.dispatch_task(
+            "fake", "build foo", cwd=str(work.resolve()), **kwargs
+        )
+        assert reused["task_id"] == dispatched["task_id"]
+        assert reused["reused"] is True
+
+        waited = await registry.wait_task(dispatched["task_id"], timeout_sec=5)
+        assert waited["task_mode"] == "write"
+        assert waited["write_paths"] == ["src/one.py", "tests/**"]
+        assert waited["workspace_mode"] == "patch_only"
+        assert waited["base_revision"] == "abc123"
+
+        with pytest.raises(ValueError, match="already bound"):
+            await registry.dispatch_task(
+                "fake", "different payload", cwd=str(work.resolve()), **kwargs
+            )
+    finally:
+        await registry.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("request_id", "not-a-uuid", "UUID"),
+        ("task_key", "Bad Key", "task_key"),
+        ("task_mode", " ", "task_mode"),
+        ("workspace_mode", "branch", "workspace_mode"),
+        ("write_paths", ["../outside"], "workspace-relative"),
+        ("write_paths", [r"C:\outside"], "workspace-relative"),
+        ("write_paths", ["C:outside"], "workspace-relative"),
+        ("write_paths", ["."], "workspace-relative"),
+        ("base_revision", " ", "base_revision"),
+    ],
+)
+async def test_dispatch_rejects_invalid_tasknode_metadata(
+    bridge_home, tmp_path, field, value, message
+):
+    work = tmp_path / "work"
+    work.mkdir()
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    try:
+        with pytest.raises(ValueError, match=message):
+            await registry.dispatch_task(
+                "fake", "build foo", cwd=str(work.resolve()), **{field: value}
+            )
+    finally:
+        await registry.stop()
+
+
+def test_session_scope_is_explicit(bridge_home, monkeypatch):
+    registry = Registry.create(bridge_home)
+    monkeypatch.setattr("agent_bridge.registry.count_sibling_servers", lambda: 3)
+    assert registry.session_scope() == {
+        "scope": "current_instance",
+        "other_live_instances": 3,
+    }
+
+
+@pytest.mark.asyncio
+async def test_parallel_worktree_tasknodes_use_distinct_overlapping_sessions(
+    bridge_home, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("AGENT_BRIDGE_FAKE_DELAY", "0.2")
+    left = tmp_path / "left-worktree"
+    right = tmp_path / "right-worktree"
+    left.mkdir()
+    right.mkdir()
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    try:
+        first = await registry.dispatch_task(
+            "fake",
+            "write left",
+            cwd=str(left.resolve()),
+            request_id="1ca6beac-afd1-4c96-bc65-81b935e47cb7",
+            task_key="drill/left",
+            task_mode="write",
+            write_paths=["left.txt"],
+            workspace_mode="worktree",
+            base_revision="base-1",
+        )
+        second = await registry.dispatch_task(
+            "fake",
+            "write right",
+            cwd=str(right.resolve()),
+            request_id="5f3d4e7f-4eed-4d46-bcdb-284c4d257f7b",
+            task_key="drill/right",
+            task_mode="write",
+            write_paths=["right.txt"],
+            workspace_mode="worktree",
+            base_revision="base-1",
+        )
+        assert first["session_id"] != second["session_id"]
+
+        first_result, second_result = await asyncio.gather(
+            registry.wait_task(first["task_id"], timeout_sec=5),
+            registry.wait_task(second["task_id"], timeout_sec=5),
+        )
+        assert first_result["task_key"] == "drill/left"
+        assert first_result["write_paths"] == ["left.txt"]
+        assert second_result["task_key"] == "drill/right"
+        assert second_result["write_paths"] == ["right.txt"]
+        latest_start = max(
+            datetime.fromisoformat(first_result["started_at"]),
+            datetime.fromisoformat(second_result["started_at"]),
+        )
+        earliest_finish = min(
+            datetime.fromisoformat(first_result["finished_at"]),
+            datetime.fromisoformat(second_result["finished_at"]),
+        )
+        assert latest_start < earliest_finish
+    finally:
+        await registry.stop()
 
 
 @pytest.mark.asyncio
@@ -555,6 +699,75 @@ async def test_old_terminal_tasks_are_pruned(bridge_home, tmp_path, monkeypatch)
         assert len(terminal) <= 3  # 2 kept terminal + possibly the newest
     finally:
         await registry.stop()
+
+
+@pytest.mark.asyncio
+async def test_request_id_replay_survives_task_pruning_and_restart(
+    bridge_home, tmp_path, monkeypatch
+):
+    monkeypatch.setattr("agent_bridge.registry.TASK_KEEP_PER_SESSION", 1)
+    work = tmp_path / "work"
+    work.mkdir()
+    request_id = "b2349f1d-c418-4bbb-a334-3f1595ab6f79"
+    kwargs = {
+        "request_id": request_id,
+        "task_key": "drill/durable-idempotency",
+        "task_mode": "write",
+        "write_paths": ["owned.txt"],
+        "workspace_mode": "worktree",
+        "base_revision": "base-1",
+    }
+
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    try:
+        first = await registry.dispatch_task(
+            "fake", "write once", cwd=str(work.resolve()), **kwargs
+        )
+        first_result = await registry.wait_task(first["task_id"], timeout_sec=5)
+        for index in range(2):
+            more = await registry.dispatch_task(
+                "fake",
+                f"other-{index}",
+                cwd=str(work.resolve()),
+                session_id=first["session_id"],
+            )
+            await registry.wait_task(more["task_id"], timeout_sec=5)
+
+        assert first["task_id"] not in registry.tasks
+        assert (
+            registry.request_tombstones[request_id].result_text
+            == first_result["result_text"]
+        )
+        replay = await registry.dispatch_task(
+            "fake", "write once", cwd=str(work.resolve()), **kwargs
+        )
+        assert replay["reused"] is True
+        assert replay["task_id"] == first["task_id"]
+        assert (
+            registry.get_result(first["task_id"])["result_text"]
+            == first_result["result_text"]
+        )
+    finally:
+        await registry.stop()
+
+    restarted = Registry.create(bridge_home)
+    await restarted.start()
+    try:
+        replay = await restarted.dispatch_task(
+            "fake", "write once", cwd=str(work.resolve()), **kwargs
+        )
+        assert replay["reused"] is True
+        assert replay["task_id"] == first["task_id"]
+        assert (
+            await restarted.wait_task(first["task_id"], timeout_sec=0.1)
+        )["timed_out"] is False
+        with pytest.raises(ValueError, match="already bound"):
+            await restarted.dispatch_task(
+                "fake", "different payload", cwd=str(work.resolve()), **kwargs
+            )
+    finally:
+        await restarted.stop()
 
 
 @pytest.mark.asyncio

@@ -25,6 +25,10 @@ def test_handshake_instructions_carry_hard_rules():
         "coordinator.mode",
         "dispatch_enabled",
         "runtime_context",
+        "request_id",
+        "write_paths",
+        "never creates or merges worktrees",
+        "Provider-native subagents may work",
         "cancel_task",
         "end_session",
     ):

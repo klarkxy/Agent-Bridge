@@ -35,12 +35,18 @@ async def lifespan(_server: MCPServer[Registry]) -> AsyncIterator[Registry]:
 # Injected into the coordinator's context at the MCP handshake — the one
 # channel that needs no copied rules file and no skill install.
 INSTRUCTIONS = (
-    "Agent Bridge dispatches tasks to local worker CLIs (Grok, Kimi Code, "
+    "Agent Bridge executes already-defined external TaskNode leaves through local "
+    "worker CLIs (Grok, Kimi Code, "
     "Antigravity, DeepSeek Harness, OpenCode, Claude Code, Codex CLI) and keeps their "
     "sessions resumable.\n"
     "Hard rules: workers are reached only through these tools — never drive the "
-    "worker CLIs or GUIs directly. dispatch_task.cwd is this conversation's "
-    "project folder (absolute), not the Agent Bridge install path. A wait_task "
+    "worker CLIs or GUIs directly. The top-level coordinator owns routing, Git, "
+    "and worktrees. Provider-native subagents may work inside the assigned leaf, "
+    "but descendants must not receive or call Bridge, own Git state, or accept "
+    "results. dispatch_task.cwd is the coordinator's absolute workspace; Bridge never "
+    "creates or merges worktrees. Pass request_id, task_key, task_mode, "
+    "write_paths, workspace_mode, and base_revision as attribution metadata. "
+    "A wait_task "
     "timeout is not failure; call it again. Verify results with get_result plus "
     "your own git diff — do not trust a worker's self-report. An empty Kimi "
     "result with non-empty warnings is a failed turn, not a no-op.\n"
@@ -118,8 +124,14 @@ async def dispatch_task(
     effort: str | None = None,
     title: str | None = None,
     user_requested: bool = False,
+    request_id: str | None = None,
+    task_key: str | None = None,
+    task_mode: str | None = None,
+    write_paths: list[str] | None = None,
+    workspace_mode: str | None = None,
+    base_revision: str | None = None,
 ) -> dict[str, Any]:
-    """Start a worker turn. cwd is this coordinator conversation's project (absolute). model/effort are optional coordinator choices (agy: --model/--effort/--new-project; grok: session/setModel after /new; kimi/opencode/claude: session/set_config_option after new/resume; dsh: spawn env, respawn if they change; codex: exec -m / -c model_reasoning_effort, off->none). Pass session_id to continue. Set user_requested=true only when the user explicitly asked for a worker (required in manual mode). Rejected when coordinator.dispatch_enabled is false, even with user_requested=true. Returns immediately."""
+    """Start one already-defined external TaskNode turn. cwd is the absolute coordinator-owned workspace; Bridge never creates or merges worktrees. Optional request_id/task_key/task_mode/write_paths/workspace_mode/base_revision are attribution metadata, not an OS sandbox. Pass session_id only to continue in the same cwd. Set user_requested=true only when the user explicitly asked for a worker (required in manual mode). Rejected when coordinator.dispatch_enabled is false. Returns immediately."""
     try:
         result = await _registry(ctx).dispatch_task(
             agent=agent,
@@ -130,6 +142,12 @@ async def dispatch_task(
             effort=effort,
             title=title,
             user_requested=user_requested,
+            request_id=request_id,
+            task_key=task_key,
+            task_mode=task_mode,
+            write_paths=write_paths,
+            workspace_mode=workspace_mode,
+            base_revision=base_revision,
         )
         return {"ok": True, **result}
     except Exception as exc:
@@ -194,7 +212,7 @@ async def cancel_task(ctx: Context, task_id: str) -> dict[str, Any]:
 
 @mcp.tool(annotations=READ_ONLY)
 async def list_sessions(ctx: Context, active_only: bool = False) -> dict[str, Any]:
-    """List sessions owned by this Bridge instance and report live siblings."""
+    """List sessions owned by this Bridge server instance and report how many sibling instances are live."""
     try:
         registry = _registry(ctx)
         return {

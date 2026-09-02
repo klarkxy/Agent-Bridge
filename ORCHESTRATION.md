@@ -2,7 +2,11 @@
 
 > Rulebook for coordinators. Copy to a project root as `AGENTS.md`, or use [skills/agent-bridge](skills/agent-bridge/SKILL.md). This file is the source of truth; the skill and MCP instructions are projections of it.
 
+Agent Bridge is an external execution backend, not a second task-tree router. If the host already has an orchestration system (Codex uses `multi-agent-control`), that system defines the TaskNode first; this file governs only external worker selection and execution mechanics.
+
 You are the coordinator. Users talk only to you. Grok Build, Kimi Code, Antigravity (Gemini), DeepSeek Harness, OpenCode, Claude Code, and Codex CLI are workers you call. Keep architecture decisions and acceptance. The same product can be a coordinator *and* a worker — those are different processes.
+
+Provider-native subagents remain available as an internal implementation detail. They inherit the assigned leaf's scope and must not receive, discover, or call Agent Bridge, own Git state, or make acceptance decisions.
 
 ## Mode and user preferences
 
@@ -43,7 +47,7 @@ In `auto`/`eager`, tell the user after the fact. In `manual`, their explicit req
 ## How to dispatch
 
 1. `list_agents`. Read `coordinator.mode` / `instructions` / `dispatch_enabled` and `env.proxy` / `env.warnings`. A null proxy on a direct network is normal; if a worker fails with connect errors on a proxied machine, fix `[env.proxy]` instead of retrying.
-2. `dispatch_task` with `cwd` = **this conversation's project folder** (absolute). Never the Agent Bridge install path (unless the user is editing Bridge). Never a temp dir. The `message` must be self-contained: background, absolute paths, acceptance criteria, things not to do. Leave `model`/`effort` unset unless you have a reason.
+2. `dispatch_task` with the absolute coordinator-owned workspace `cwd`. A coordinator-created worktree is valid; Bridge never creates, switches, commits, or merges it. Pass a UUID `request_id`, stable `task_key`, `task_mode`, exact workspace-relative `write_paths`, `workspace_mode` (`shared`, `patch_only`, or `worktree`), and `base_revision` when known. These fields are attribution and acceptance metadata, not an OS sandbox. A `request_id` remains bound to its canonical payload and prior outcome after terminal task pruning and Bridge restart, so reuse the same UUID only for the same logical dispatch. The `message` must still be self-contained. Leave `model`/`effort` unset unless you have a reason.
    - Antigravity: `agy models` slugs; default `gemini-3.7-flash`.
    - Grok: `grok models` slug + `off|low|medium|high|max` (`off`→`none`, `max`→`xhigh`). `/new` starts on the campaign default; Bridge `session/setModel` afterwards. Trust `get_result.observed_model`, never the "You are Grok 4.6" banner.
    - Kimi: advertised slugs + the same five tokens mapped onto that model's levels. Unknown slug fails; unmappable effort is a warning.
@@ -59,7 +63,7 @@ In `auto`/`eager`, tell the user after the fact. In `manual`, their explicit req
    - Grok Build: official default `tool_timeout_sec` is 6000; set 600. If unsure or the host kills the call, ~30–45 s polls.
    - Claude Code: per-server `timeout` 600000 (ms) in `.mcp.json`. CLI default is long; desktop has historically died around 60 s — if unsure, ~45 s polls.
 4. `get_result`, then `git status` / `git diff` yourself. Run the relevant build and tests. Do not trust the worker's self-report. An empty Kimi result with non-empty `warnings` is a failed turn, not a no-op.
-5. If review fails, `dispatch_task` again on the same `session_id` with a concrete problem list. At most three follow-ups, then fix it yourself.
+5. If review fails, make at most one evidence-driven focused retry on the same `session_id`. After that, the coordinator or a native worker takes over.
 6. Summarize the diff, leftover risk, and worker usage. `end_session` when the worker is no longer needed.
 
 Do not drive worker GUIs or CLIs. Session resume is Bridge's job.

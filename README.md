@@ -100,7 +100,7 @@ Close coordinators that are holding Bridge, then `agent-bridge upgrade`, then re
 | --- | --- |
 | `list_agents` | Probe workers, report proxy/env + coordinator policy |
 | `set_preferences` | Persist coordinator mode / routing preferences |
-| `dispatch_task` | Start or resume a turn in the project `cwd` |
+| `dispatch_task` | Run an attributed external TaskNode in the coordinator-owned `cwd` |
 | `wait_task` | Block up to `timeout_sec` (default 180) |
 | `check_task` | Non-blocking status |
 | `get_result` | Truncated result + changed files |
@@ -220,7 +220,7 @@ revivable = true
 | --- | --- |
 | `list_agents` | 探测 worker，报告代理 / 环境 + 协调者策略 |
 | `set_preferences` | 持久化协调者模式 / 路由偏好 |
-| `dispatch_task` | 在项目 `cwd` 里开始或续上一次回合 |
+| `dispatch_task` | 在协调器拥有的 `cwd` 中执行带归属信息的外部 TaskNode |
 | `wait_task` | 最多等待 `timeout_sec`（默认 180） |
 | `check_task` | 非阻塞状态查询 |
 | `get_result` | 截断后的结果 + 改过的文件 |

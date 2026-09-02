@@ -17,7 +17,14 @@ from agent_bridge.models import Session, grok_effort
 
 def test_grok_cli_flags_precede_stdio():
     cmd = with_grok_cli_selection(
-        ["grok", "--no-auto-update", "agent", "--always-approve", "--no-leader", "stdio"],
+        [
+            "grok",
+            "--no-auto-update",
+            "agent",
+            "--always-approve",
+            "--no-leader",
+            "stdio",
+        ],
         "grok-4.5",
         "low",
     )
@@ -25,6 +32,7 @@ def test_grok_cli_flags_precede_stdio():
     assert cmd.index("--effort") < cmd.index("stdio")
     assert cmd[cmd.index("--model") + 1] == "grok-4.5"
     assert cmd[cmd.index("--effort") + 1] == "low"
+    assert "--no-subagents" not in cmd
 
 
 def test_dsh_needs_respawn_when_model_changes():

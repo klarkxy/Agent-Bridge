@@ -29,6 +29,11 @@ from agent_bridge.models import (
     TaskStatus,
     iso,
     normalize_effort,
+    normalize_request_id,
+    normalize_task_key,
+    normalize_task_mode,
+    normalize_workspace_mode,
+    normalize_write_paths,
 )
 from agent_bridge.paths import ensure_home, state_path
 from agent_bridge.persist import atomic_write_json, read_json
@@ -96,6 +101,10 @@ class Registry:
         self.config = config
         self.sessions: dict[str, Session] = {}
         self.tasks: dict[str, Task] = {}
+        # Terminal request-bound tasks move here when normal task history is
+        # pruned.  Keeping the canonical payload and outcome prevents a late
+        # retry from executing the same logical request again.
+        self.request_tombstones: dict[str, Task] = {}
         self._adapters: dict[str, Adapter] = {}
         self._done: dict[str, asyncio.Event] = {}
         self._idle: dict[str, asyncio.Task[None]] = {}
@@ -185,6 +194,14 @@ class Registry:
                     {task.task_id: task.model_dump(mode="json") for task in self.tasks.values()},
                     "task_id",
                 ),
+                "request_tombstones": self._merge_owned(
+                    disk.get("request_tombstones") or [],
+                    {
+                        request_id: task.model_dump(mode="json")
+                        for request_id, task in self.request_tombstones.items()
+                    },
+                    "request_id",
+                ),
             },
         )
 
@@ -249,6 +266,14 @@ class Registry:
             done = asyncio.Event()
             done.set()
             self._done[task.task_id] = done
+        for raw in payload.get("request_tombstones") or []:
+            task = Task.model_validate(raw)
+            if task.request_id is None or self._foreign_live(
+                task.owner_pid, task.owner_create_time
+            ):
+                continue
+            self._stamp_owner(task)
+            self.request_tombstones[task.request_id] = task
         self.save()
         self.touch_activity()
         if self.config.server.idle_exit_sec > 0:
@@ -291,6 +316,36 @@ class Registry:
             if task.session_id == session_id and task.status in {TaskStatus.queued, TaskStatus.running}:
                 return task
         return None
+
+    @staticmethod
+    def _same_request(
+        task: Task,
+        *,
+        agent: str,
+        message: str,
+        cwd_path: Path,
+        model: str | None,
+        effort: str | None,
+        session_id: str | None,
+        task_key: str | None,
+        task_mode: str | None,
+        write_paths: list[str],
+        workspace_mode: str | None,
+        base_revision: str | None,
+    ) -> bool:
+        return (
+            task.agent == agent
+            and task.message == message
+            and Path(task.cwd).resolve() == cwd_path.resolve()
+            and task.requested_model == model
+            and task.requested_effort == effort
+            and task.task_key == task_key
+            and task.task_mode == task_mode
+            and task.write_paths == write_paths
+            and task.workspace_mode == workspace_mode
+            and task.base_revision == base_revision
+            and (session_id is None or task.session_id == session_id)
+        )
 
     async def list_agents(self) -> list[dict]:
         probes = [probe_agent(cfg, self.config.env) for cfg in self.config.agents.values()]
@@ -359,6 +414,12 @@ class Registry:
         effort: str | None = None,
         title: str | None = None,
         user_requested: bool = False,
+        request_id: str | None = None,
+        task_key: str | None = None,
+        task_mode: str | None = None,
+        write_paths: list[str] | None = None,
+        workspace_mode: str | None = None,
+        base_revision: str | None = None,
     ) -> dict:
         if not self.dispatch_enabled:
             raise RuntimeError(NESTED_DISPATCH_ERROR)
@@ -376,8 +437,54 @@ class Registry:
         if not cwd_path.is_dir():
             raise ValueError(f"cwd is not a directory: {cwd_path}")
         effort = normalize_effort(effort)
+        request_id = normalize_request_id(request_id)
+        task_key = normalize_task_key(task_key)
+        task_mode = normalize_task_mode(task_mode)
+        write_paths = normalize_write_paths(write_paths)
+        workspace_mode = normalize_workspace_mode(workspace_mode)
+        if base_revision is not None:
+            base_revision = base_revision.strip()
+            if not base_revision:
+                raise ValueError("base_revision must not be empty")
         cfg = self.config.get(agent)
         async with self._lock:
+            if request_id:
+                previous = next(
+                    (task for task in self.tasks.values() if task.request_id == request_id),
+                    None,
+                )
+                if previous is None:
+                    previous = self.request_tombstones.get(request_id)
+                if previous is not None:
+                    if not self._same_request(
+                        previous,
+                        agent=agent,
+                        message=message,
+                        cwd_path=cwd_path,
+                        model=model,
+                        effort=effort,
+                        session_id=session_id,
+                        task_key=task_key,
+                        task_mode=task_mode,
+                        write_paths=write_paths,
+                        workspace_mode=workspace_mode,
+                        base_revision=base_revision,
+                    ):
+                        raise ValueError(
+                            f"request_id {request_id} is already bound to another payload"
+                        )
+                    session = self.sessions.get(previous.session_id)
+                    return {
+                        "task_id": previous.task_id,
+                        "session_id": previous.session_id,
+                        "agent": previous.agent,
+                        "model": session.model if session else previous.model,
+                        "effort": session.effort if session else previous.effort,
+                        "request_id": previous.request_id,
+                        "task_key": previous.task_key,
+                        "reused": True,
+                        "status": previous.status.value,
+                    }
             if session_id:
                 session = self.sessions.get(session_id)
                 if session is None:
@@ -423,6 +530,14 @@ class Registry:
                 cwd=session.cwd,
                 model=model or session.model,
                 effort=effort or session.effort,
+                requested_model=model,
+                requested_effort=effort,
+                request_id=request_id,
+                task_key=task_key,
+                task_mode=task_mode,
+                write_paths=write_paths,
+                workspace_mode=workspace_mode,
+                base_revision=base_revision,
                 status=TaskStatus.queued,
             )
             self._stamp_owner(task)
@@ -438,6 +553,9 @@ class Registry:
             "agent": agent,
             "model": session.model,
             "effort": session.effort,
+            "request_id": task.request_id,
+            "task_key": task.task_key,
+            "reused": False,
         }
 
     async def _run_task(self, task_id: str) -> None:
@@ -520,6 +638,8 @@ class Registry:
                 continue
             terminal.sort(key=lambda item: item.created_at)
             for old in terminal[: len(terminal) - TASK_KEEP_PER_SESSION]:
+                if old.request_id is not None:
+                    self.request_tombstones[old.request_id] = old.model_copy(deep=True)
                 self.tasks.pop(old.task_id, None)
                 self._done.pop(old.task_id, None)
 
@@ -559,6 +679,15 @@ class Registry:
     def _require_task(self, task_id: str) -> Task:
         task = self.tasks.get(task_id)
         if task is None:
+            task = next(
+                (
+                    candidate
+                    for candidate in self.request_tombstones.values()
+                    if candidate.task_id == task_id
+                ),
+                None,
+            )
+        if task is None:
             raise KeyError(f"unknown task {task_id}")
         return task
 
@@ -575,6 +704,12 @@ class Registry:
             "files_changed": task.files_changed,
             "model": task.model,
             "effort": task.effort,
+            "request_id": task.request_id,
+            "task_key": task.task_key,
+            "task_mode": task.task_mode,
+            "write_paths": task.write_paths,
+            "workspace_mode": task.workspace_mode,
+            "base_revision": task.base_revision,
             "observed_model": task.observed_model,
             "observed_effort": task.observed_effort,
             "created_at": task.created_at,
@@ -622,8 +757,8 @@ class Registry:
             try:
                 await asyncio.wait_for(event.wait(), timeout=timeout_sec)
             except TimeoutError:
-                return {"timed_out": True, **self._task_snapshot(self.tasks[task_id])}
-        return {"timed_out": False, **self._task_snapshot(self.tasks[task_id], include_result=True)}
+                return {"timed_out": True, **self._task_snapshot(task)}
+        return {"timed_out": False, **self._task_snapshot(task, include_result=True)}
 
     def check_task(self, task_id: str) -> dict:
         return self._task_snapshot(self._require_task(task_id))

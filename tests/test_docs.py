@@ -122,8 +122,10 @@ def test_orchestration_keeps_worker_loop_rules_in_both_languages():
     assert "超时" in zh
     assert "same `session_id`" in en
     assert "同一个 `session_id`" in zh
-    assert "three follow-up" in en
-    assert "跟进三轮" in zh
+    assert "one evidence-driven focused retry" in en
+    assert "一次基于证据的聚焦重试" in zh
+    assert "Provider-native subagents remain available" in en
+    assert "保留各 Provider 原生的 subagent 能力" in zh
     assert "empty Kimi" in en
     assert "空文本" in zh or "warnings" in zh
     assert "cancel_task" in en

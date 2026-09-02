@@ -455,4 +455,4 @@ If `OPENROUTER_API_KEY` is set and `ANTHROPIC_AUTH_TOKEN` is not, Bridge copies 
 
 ## Permissions
 
-Most worker CLIs run in always-approve / skip-permissions mode. Codex CLI defaults to `--approve-for-me` (auto review + workspace-write); `--yolo` is opt-in via `[agents.codex] session_meta = { yolo = true }`. Review is the coordinator's job: `git diff`, build, tests. Cap follow-up turns at three, then the coordinator patches the rest.
+Most worker CLIs run in always-approve / skip-permissions mode. Codex CLI defaults to `--approve-for-me` (auto review + workspace-write); `--yolo` is opt-in via `[agents.codex] session_meta = { yolo = true }`. Review is the coordinator's job: `git diff`, build, tests. Permit one evidence-driven focused retry, then the coordinator or a native worker takes over.
