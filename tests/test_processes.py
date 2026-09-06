@@ -42,13 +42,15 @@ def test_skips_grok_agent_as_cursor(monkeypatch, tmp_path):
     grok_agent.write_text("fake", encoding="utf-8")
 
     def fake_which(name: str):
-        if name in {"agent", "agent.exe"}:
+        if Path(name).name.lower() in {"agent", "agent.exe"}:
             return str(grok_agent)
         return None
 
     monkeypatch.setattr("agent_bridge.processes.resolve_executable", fake_which)
     with pytest.raises(FileNotFoundError, match="not Cursor"):
         resolve_command(["cursor-agent", "acp"], [["agent", "acp"]])
+    with pytest.raises(FileNotFoundError, match="not Cursor"):
+        resolve_command([str(grok_agent), "acp"])
 
 
 def test_resolve_command_skips_invalid_candidate(tmp_path: Path):

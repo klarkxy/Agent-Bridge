@@ -876,6 +876,12 @@ class Registry:
                 " Claude Code observed_model/effort are the last values Bridge "
                 "successfully set on the session after mapping, not a live sampler."
             )
+        if task.agent == "cursor":
+            hint += (
+                " Cursor observed_model is the requested ID after Cursor confirmed "
+                "its mapped ACP options; observed_effort is Cursor's confirmed thought "
+                "level. Neither is a live sampler."
+            )
         if task.agent == "devin":
             hint += (
                 " Devin observed_model is the last id Bridge set on the session; "

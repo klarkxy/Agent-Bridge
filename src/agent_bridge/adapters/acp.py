@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import subprocess
 import sys
 from collections.abc import Iterable
@@ -53,13 +54,14 @@ GROK_SET_MODEL_METHODS = ("session/setModel", "session/set_model")
 # These workers' session/load replays persisted history as session/update
 # notifications. session/resume is advertised and skips that replay.
 _RESUME_AGENTS = frozenset({"kimi", "opencode", "claude"})
-_CONFIG_OPTION_AGENTS = frozenset({"kimi", "opencode", "claude", "devin"})
-_MODEL_EFFORT_AGENTS = frozenset({"grok", "dsh", "kimi", "opencode", "claude", "devin"})
+_CONFIG_OPTION_AGENTS = frozenset({"kimi", "opencode", "claude", "devin", "cursor"})
+_MODEL_EFFORT_AGENTS = frozenset({"grok", "dsh", "kimi", "opencode", "claude", "devin", "cursor"})
 
 # Handshake-style RPCs (initialize, session/new, session/load, setModel)
 # normally answer in seconds. A worker that wedges before the prompt would
 # otherwise hang dispatch forever; prompt itself stays unbounded by design.
 RPC_TIMEOUT_SEC = 60.0
+CURSOR_MODEL_LIST_TIMEOUT_SEC = 30.0
 
 # ACP ToolKind values that can change the workspace. Read-only kinds (read,
 # search, fetch, think, ...) also carry locations; counting them would report
@@ -125,6 +127,202 @@ def with_grok_cli_selection(
             index = cmd.index(token)
             return cmd[:index] + extras + cmd[index:]
     return cmd + extras
+
+
+def with_cursor_cli_model(command: list[str], model: str | None) -> list[str]:
+    """Pin Cursor's model before its ACP subcommand."""
+    cmd = list(command)
+    if not model:
+        return cmd
+    try:
+        index = cmd.index("acp")
+    except ValueError:
+        raise RuntimeError(
+            "cursor model selection requires an 'acp' token in the configured command"
+        ) from None
+    return [*cmd[:index], "--model", model, *cmd[index:]]
+
+
+def cursor_list_models_command(command: list[str]) -> list[str]:
+    """Build the matching Cursor CLI model-discovery command."""
+    cmd = list(command)
+    try:
+        index = cmd.index("acp")
+    except ValueError:
+        raise RuntimeError(
+            "cursor model discovery requires an 'acp' token in the configured command"
+        ) from None
+    executable = Path(cmd[0]).name.lower()
+    if executable in {"agent", "agent.exe"}:
+        return [*cmd[:index], "models"]
+    return [*cmd[:index], "--list-models"]
+
+
+def parse_cursor_models(output: str) -> dict[str, str]:
+    """Parse the stable ``<id> - <label>`` rows from ``--list-models``."""
+    models: dict[str, str] = {}
+    for raw_line in output.splitlines():
+        model, separator, label = raw_line.strip().partition(" - ")
+        if separator and model and label and not any(char.isspace() for char in model):
+            models[model] = label
+    return models
+
+
+def _cursor_words(value: str) -> tuple[str, ...]:
+    return tuple(re.findall(r"[a-z0-9]+", value.casefold()))
+
+
+def _cursor_without_base(words: tuple[str, ...], base: str) -> tuple[str, ...]:
+    remaining = list(words)
+    for word in _cursor_words(base):
+        if word in remaining:
+            remaining.remove(word)
+    return tuple(remaining)
+
+
+def _cursor_choices(config_options: list[Any], option_id: str) -> list[tuple[str, str]]:
+    for option in config_options:
+        dumped = _dump(option)
+        if not isinstance(dumped, dict) or dumped.get("id") != option_id:
+            continue
+        raw = dumped.get("options")
+        if not isinstance(raw, list):
+            return []
+        choices: list[tuple[str, str]] = []
+        pending = list(raw)
+        while pending:
+            entry = _dump(pending.pop(0))
+            if not isinstance(entry, dict):
+                continue
+            nested = entry.get("options")
+            if isinstance(nested, list) and "value" not in entry:
+                pending[0:0] = nested
+                continue
+            value = entry.get("value")
+            if isinstance(value, str):
+                name = entry.get("name")
+                choices.append((value, name if isinstance(name, str) else value))
+        return choices
+    return []
+
+
+def _cursor_base_model(model: str, label: str, config_options: list[Any]) -> tuple[str, str]:
+    choices = _cursor_choices(config_options, "model")
+    for value, name in choices:
+        if model == value:
+            return value, name
+    label_words = _cursor_words(label)
+    matches = [
+        (len(_cursor_words(name)), value, name)
+        for value, name in choices
+        if label_words[: len(_cursor_words(name))] == _cursor_words(name)
+    ]
+    if not matches:
+        raise ValueError(
+            f"cursor model {model!r} does not match ACP models "
+            f"{[value for value, _name in choices] or '(none)'}"
+        )
+    _length, value, name = max(matches)
+    return value, name
+
+
+def _cursor_has_phrase(words: tuple[str, ...], phrase: tuple[str, ...]) -> bool:
+    return bool(phrase) and any(
+        words[index : index + len(phrase)] == phrase
+        for index in range(len(words) - len(phrase) + 1)
+    )
+
+
+def _cursor_effort_option_ids(config_options: list[Any]) -> list[str]:
+    ids: list[str] = []
+    for option in config_options:
+        dumped = _dump(option)
+        if not isinstance(dumped, dict):
+            continue
+        option_id = dumped.get("id")
+        offered = [value for value, _name in _cursor_choices(config_options, str(option_id))]
+        if (
+            isinstance(option_id, str)
+            and set(offered) != {"true", "false"}
+            and (
+                dumped.get("category") == "thought_level"
+                or option_id in {"effort", "reasoning", "reasoning_effort"}
+            )
+        ):
+            ids.append(option_id)
+    return ids
+
+
+def _resolve_cursor_effort(effort: str, offered: list[str]) -> str | None:
+    preferences = {
+        "off": ("off", "none", "minimal", "low"),
+        "low": ("low", "minimal"),
+        "medium": ("medium", "high", "low"),
+        "high": ("high", "xhigh", "medium"),
+        "max": ("max", "xhigh", "high"),
+    }
+    return next(
+        (candidate for candidate in preferences.get(effort, (effort,)) if candidate in offered),
+        None,
+    )
+
+
+def _cursor_parameter_targets(
+    model: str,
+    label: str,
+    base: str,
+    base_name: str,
+    effort: str | None,
+    config_options: list[Any],
+) -> dict[str, str]:
+    label_words = _cursor_words(label)
+    base_words = _cursor_words(base_name)
+    suffix = label_words[len(base_words) :] if label_words[: len(base_words)] == base_words else label_words
+    suffix = _cursor_without_base(suffix, base)
+    model_words = _cursor_without_base(_cursor_words(model), base)
+    targets: dict[str, str] = {}
+    for option in config_options:
+        dumped = _dump(option)
+        if not isinstance(dumped, dict):
+            continue
+        option_id = dumped.get("id")
+        if not isinstance(option_id, str) or option_id in {"mode", "model"}:
+            continue
+        choices = _cursor_choices(config_options, option_id)
+        offered = [value for value, _name in choices]
+        category = str(dumped.get("category") or "")
+        if (
+            effort
+            and set(offered) != {"true", "false"}
+            and (
+                category == "thought_level"
+                or option_id in {"effort", "reasoning", "reasoning_effort"}
+            )
+        ):
+            target = _resolve_cursor_effort(effort, offered)
+            if target:
+                targets[option_id] = target
+            continue
+        if set(offered) == {"true", "false"}:
+            enabled = _cursor_has_phrase(model_words, _cursor_words(option_id)) or any(
+                value == "true"
+                and (
+                    _cursor_has_phrase(model_words, _cursor_words(name))
+                    or _cursor_has_phrase(suffix, _cursor_words(name))
+                )
+                for value, name in choices
+            )
+            targets[option_id] = "true" if enabled else "false"
+            continue
+        matches = [
+            (max(len(_cursor_words(value)), len(_cursor_words(name))), value)
+            for value, name in choices
+            if _cursor_has_phrase(model_words, _cursor_words(value))
+            or _cursor_has_phrase(suffix, _cursor_words(name))
+        ]
+        if matches:
+            targets[option_id] = max(matches)[1]
+    return targets
 
 
 def dsh_needs_respawn(
@@ -377,9 +575,9 @@ class _Live:
         self.applied_model: str | None = None
         self.applied_effort: str | None = None
         self.applied_mode: str | None = None
-        # Latest `configOptions` snapshot from a Kimi lifecycle or
-        # set_config_option response: the only place the model's advertised
-        # thinking levels are published.
+        # Latest `configOptions` snapshot from a supported ACP lifecycle or
+        # set_config_option response: the only place model-specific parameters
+        # such as thinking level and fast mode are published.
         self.config_options: list[Any] = []
         # Warnings raised outside a turn (e.g. during ensure_session);
         # drained into the next TurnResult.
@@ -390,6 +588,7 @@ class AcpAdapter(Adapter):
     def __init__(self, agent: AgentConfig, home: Path, env_config=None) -> None:
         super().__init__(agent, home, env_config)
         self._live: dict[str, _Live] = {}
+        self._cursor_models_cache: dict[str, str] | None = None
 
     def _env(self) -> dict[str, str]:
         env = build_worker_env(self.agent.env, config=self.env_config, worker_context=True)
@@ -443,6 +642,48 @@ class AcpAdapter(Adapter):
                 f"{self.agent.name} {what} timed out after {int(timeout)}s"
             ) from None
 
+    async def _cursor_models(
+        self,
+        command: list[str],
+        env: dict[str, str],
+        cwd: str | None,
+    ) -> dict[str, str]:
+        if self._cursor_models_cache is not None:
+            return self._cursor_models_cache
+        model_cmd = cursor_list_models_command(command)
+        proc = await asyncio.create_subprocess_exec(
+            *model_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+            cwd=cwd,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=CURSOR_MODEL_LIST_TIMEOUT_SEC
+            )
+        except asyncio.CancelledError:
+            await reap_subprocess(proc)
+            raise
+        except TimeoutError:
+            await reap_subprocess(proc)
+            raise RuntimeError(
+                "cursor model discovery timed out; run 'cursor-agent --list-models' "
+                "to check the current account"
+            ) from None
+        if proc.returncode:
+            detail = stderr.decode("utf-8", errors="replace").strip()
+            suffix = f": {detail[-1000:]}" if detail else ""
+            raise RuntimeError(f"cursor model discovery failed{suffix}")
+        models = parse_cursor_models(stdout.decode("utf-8", errors="replace"))
+        if not models:
+            raise RuntimeError(
+                "cursor model discovery returned no model IDs; run "
+                "'cursor-agent --list-models' to check the current account"
+            )
+        self._cursor_models_cache = models
+        return models
+
     async def _spawn(self, session: Session) -> _Live:
         await self.shutdown(session)
         if self.agent.name == "dsh":
@@ -460,6 +701,18 @@ class AcpAdapter(Adapter):
             )
         elif self.agent.name == "grok":
             cmd = with_grok_cli_selection(cmd, session.model, session.effort)
+        elif self.agent.name == "cursor" and session.model:
+            models = await self._cursor_models(
+                cmd,
+                env,
+                self.agent.cwd or session.cwd or None,
+            )
+            if session.model not in models:
+                raise ValueError(
+                    f"cursor model {session.model!r} is not available for the current account; "
+                    f"available model IDs: {', '.join(models)}"
+                )
+            cmd = with_cursor_cli_model(cmd, session.model)
         kwargs: dict[str, Any] = {}
         if sys.platform == "win32":
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -488,11 +741,16 @@ class AcpAdapter(Adapter):
         session.image_name = process_image_name(proc.pid) if proc.pid else None
         if proc.pid:
             record_pid(self.home, session.session_id, proc.pid, session.pid_create_time, session.image_name)
+        capabilities = ClientCapabilities(
+            field_meta={"parameterizedModelPicker": True}
+            if self.agent.name == "cursor"
+            else None
+        )
         await self._rpc(
             live.conn.initialize(
                 protocol_version=PROTOCOL_VERSION,
                 client_info=Implementation(name="agent-bridge", version="0.1.0"),
-                client_capabilities=ClientCapabilities(),
+                client_capabilities=capabilities,
             ),
             "initialize",
             session,
@@ -644,6 +902,84 @@ class AcpAdapter(Adapter):
                 f"session advertises {offered or 'no models'}"
             ) from exc
         self._remember_applied_model(live, session.model)
+
+    async def _sync_cursor_selection(self, live: _Live, session: Session) -> None:
+        if self.agent.name != "cursor" or live.conn is None or not session.native_session_id:
+            return
+        if session.model:
+            command = resolve_command(self.agent.command, self.agent.fallback_commands)
+            catalog = await self._cursor_models(
+                command,
+                self._env(),
+                self.agent.cwd or session.cwd or None,
+            )
+            label = catalog.get(session.model)
+            if label is None:
+                raise ValueError(
+                    f"cursor model {session.model!r} is not available for the current account; "
+                    f"available model IDs: {', '.join(catalog)}"
+                )
+            base, base_name = _cursor_base_model(session.model, label, live.config_options)
+            current, _offered = config_option_values(live.config_options, "model")
+            if current != base:
+                await self._set_config_option(live, session, "model", base)
+                current, _offered = config_option_values(live.config_options, "model")
+                if current != base:
+                    raise RuntimeError(
+                        f"cursor confirmed model {current!r} after selecting {base!r}"
+                    )
+            targets = _cursor_parameter_targets(
+                session.model,
+                label,
+                base,
+                base_name,
+                session.effort,
+                live.config_options,
+            )
+        else:
+            targets = _cursor_parameter_targets(
+                "",
+                "",
+                "",
+                "",
+                session.effort,
+                live.config_options,
+            )
+        effort_ids = _cursor_effort_option_ids(live.config_options)
+        effort_mapped = not session.effort or any(
+            option_id in targets for option_id in effort_ids
+        )
+        for option_id, target in targets.items():
+            current, offered = config_option_values(live.config_options, option_id)
+            if target not in offered:
+                raise RuntimeError(
+                    f"cursor parameter {option_id}={target!r} is not advertised; "
+                    f"session offers {offered or '(none)'}"
+                )
+            if current != target:
+                await self._set_config_option(live, session, option_id, target)
+                current, _offered = config_option_values(live.config_options, option_id)
+                if current != target:
+                    raise RuntimeError(
+                        f"cursor confirmed {option_id}={current!r} after selecting {target!r}"
+                    )
+        live.applied_model = session.model
+        applied_effort_id = next(
+            (option_id for option_id in effort_ids if option_id in targets),
+            effort_ids[0] if effort_ids else None,
+        )
+        live.applied_effort = (
+            config_option_values(live.config_options, applied_effort_id)[0]
+            if applied_effort_id
+            else None
+        )
+        if not effort_mapped:
+            message = (
+                f"cursor effort={session.effort} has no counterpart on "
+                f"{session.model or 'the current model'}"
+            )
+            log.warning("%s", message)
+            live.pending_warnings.append(message)
 
     async def _sync_bypass_mode(self, live: _Live, session: Session, mode_id: str) -> None:
         """Switch a session that starts in a manual mode to ``mode_id``.
@@ -823,6 +1159,7 @@ class AcpAdapter(Adapter):
 
     async def _sync_selection(self, live: _Live, session: Session) -> None:
         await self._sync_grok_model(live, session)
+        await self._sync_cursor_selection(live, session)
         await self._sync_kimi_selection(live, session)
         await self._sync_opencode_selection(live, session)
         await self._sync_claude_selection(live, session)

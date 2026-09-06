@@ -129,6 +129,8 @@ def test_orchestration_keeps_worker_loop_rules_in_both_languages():
     assert "empty Kimi" in en
     assert "空文本" in zh or "warnings" in zh
     assert "cancel_task" in en
+    assert "same `session_id` can switch models" in en
+    assert "同一个 `session_id` 可以切换模型" in zh
     assert "nested/" in en
     assert "nested/" in zh
 
