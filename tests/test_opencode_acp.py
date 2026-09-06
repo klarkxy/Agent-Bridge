@@ -209,7 +209,7 @@ async def test_other_agents_still_use_load_session():
 @pytest.mark.asyncio
 async def test_non_opencode_agents_are_untouched_by_the_opencode_path():
     adapter, live, session = build(
-        agent_name="cursor", session_kwargs={"model": "x", "effort": "high"}
+        agent_name="grok", session_kwargs={"model": "x", "effort": "high"}
     )
     await adapter._sync_opencode_selection(live, session)
     assert live.conn.calls == []

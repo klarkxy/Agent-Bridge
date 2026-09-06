@@ -41,7 +41,7 @@ def resolve_command(
         if not resolved_exe:
             errors.append(f"{cand[0]} not found")
             continue
-        if cand[0] in {"agent", "agent.exe"} and not _looks_like_cursor(resolved_exe):
+        if Path(cand[0]).name.lower() in {"agent", "agent.exe"} and not _looks_like_cursor(resolved_exe):
             errors.append(f"{resolved_exe} (not Cursor)")
             continue
         resolved = [resolved_exe, *cand[1:]]
