@@ -31,7 +31,6 @@ from agent_bridge.quota import (
 )
 from agent_bridge.quota_claude import claude_access_token, fetch_claude_quota, parse_claude_usage
 from agent_bridge.quota_codex import fetch_codex_quota, parse_codex_rate_limits
-from agent_bridge.quota_deepseek import fetch_dsh_quota, parse_deepseek_balance
 from agent_bridge.quota_grok import fetch_grok_quota, grok_auth_token, parse_grok_billing
 from agent_bridge.quota_kimi import fetch_kimi_quota, kimi_access_token, kimi_usage_url, parse_kimi_usage
 
@@ -236,7 +235,7 @@ def test_resolve_provider_prefers_name_then_protocol():
 
 def test_provider_table_gates_experimental_workers():
     plain = default_providers()
-    assert set(plain) == {"protocol:codex", "kimi", "dsh"}
+    assert set(plain) == {"protocol:codex", "kimi"}
     full = default_providers(experimental=True)
     assert {"grok", "claude"} <= set(full)
     config = AppConfig(quota=QuotaConfig(experimental=False))
@@ -419,57 +418,25 @@ async def test_kimi_provider_sends_bearer_token(tmp_path: Path, monkeypatch):
     assert status.status == "ok" and status.windows[0].remaining_percent == 75.0
 
 
-# --- deepseek ------------------------------------------------------------------
-
-
-def test_parse_deepseek_balance_prefers_non_zero_currency():
-    payload = {
-        "is_available": True,
-        "balance_infos": [
-            {"currency": "USD", "total_balance": "0.00"},
-            {"currency": "CNY", "total_balance": "110.00"},
-        ],
-    }
-    status = parse_deepseek_balance(payload, provider="deepseek")
-    assert status.status == "ok"
-    assert status.balance == QuotaBalance(amount="110.00", currency="CNY")
-    assert status.windows == []
-    assert "deepseek" in (status.detail or "")
-
-
-def test_parse_deepseek_balance_unavailable_is_exhausted():
-    status = parse_deepseek_balance({"is_available": False, "balance_infos": [{"currency": "CNY", "total_balance": "0"}]})
-    assert status.status == "exhausted"
-    assert parse_deepseek_balance({"is_available": True}).status == "unknown"
-    assert parse_deepseek_balance(None).status == "unknown"
+# --- unsupported DSH quota -----------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_dsh_provider_needs_the_official_key(monkeypatch):
-    monkeypatch.setattr("agent_bridge.quota_deepseek.default_model", lambda env=None: ("acme", "large"))
-    status = await fetch_dsh_quota(AgentConfig(name="dsh", protocol="acp", command=["dsh-acp-demo"]), {})
-    assert status.status == "unknown"
-    assert "DEEPSEEK_API_KEY" in (status.detail or "")
-    assert "acme" in (status.detail or "")
+@pytest.mark.parametrize("experimental", [False, True])
+async def test_dsh_quota_is_unknown_even_with_deepseek_key(monkeypatch, experimental):
+    async def forbidden(*args, **kwargs):
+        pytest.fail("DSH quota must not make an HTTP request")
 
-
-@pytest.mark.asyncio
-async def test_dsh_provider_queries_balance(monkeypatch):
-    monkeypatch.setattr("agent_bridge.quota_deepseek.default_model", lambda env=None: None)
-    seen = {}
-
-    async def fake_get(url, *, headers=None, env=None, timeout=10.0):
-        seen["url"] = url
-        seen["auth"] = headers["Authorization"]
-        return {"is_available": True, "balance_infos": [{"currency": "CNY", "total_balance": "9.5"}]}
-
-    monkeypatch.setattr("agent_bridge.quota_deepseek.get_json", fake_get)
-    status = await fetch_dsh_quota(
-        AgentConfig(name="dsh", protocol="acp", command=["dsh-acp-demo"]), {"DEEPSEEK_API_KEY": "sk-ds"}
+    monkeypatch.setattr("agent_bridge.quota.get_json", forbidden)
+    config = AppConfig(quota=QuotaConfig(experimental=experimental))
+    row = await fetch_quota(
+        _agent("dsh", "acp"), {"DEEPSEEK_API_KEY": "test-key"},
+        cache=QuotaCache(60), timeout_sec=1, providers=provider_table(config),
     )
-    assert seen["url"] == "https://api.deepseek.com/user/balance"
-    assert seen["auth"] == "Bearer sk-ds"
-    assert status.status == "ok" and status.balance.amount == "9.5"
+    assert row["status"] == "unknown"
+    assert row["balance"] is None
+    assert row["windows"] == []
+    assert "not supported for dsh" in row["detail"]
 
 
 # --- grok ----------------------------------------------------------------------

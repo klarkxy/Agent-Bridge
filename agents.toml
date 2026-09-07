@@ -89,7 +89,7 @@ instructions = ""
 # resets_at, and a balance for pay-as-you-go accounts. Bridge does not route
 # on it; the coordinator weighs it against [coordinator] instructions.
 # Supported today: codex (app-server rate limits), kimi (Kimi Code OAuth
-# login), dsh (DEEPSEEK_API_KEY balance). Others answer status = "unknown".
+# login). DSH and other unsupported workers answer status = "unknown".
 enabled = true
 # One worker's lookup is cut off after this many seconds; list_agents never
 # waits longer than the slowest probe plus this.

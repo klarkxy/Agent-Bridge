@@ -363,7 +363,7 @@ Where each number comes from:
 | --- | --- | --- |
 | Codex CLI | `codex app-server` → `account/rateLimits/read` (5h + weekly, plan, credits) | ChatGPT sign-in (`codex login`); API-key logins have no plan quota |
 | Kimi Code | `GET <Kimi Code base_url>/usages` — the same call the interactive `/usage` makes | `kimi login` (OAuth); Moonshot API-key sessions answer `unknown` |
-| DeepSeek Harness | `GET https://api.deepseek.com/user/balance` (balance + `is_available`) | `DEEPSEEK_API_KEY` in `[env.set]` or the process environment |
+| DeepSeek Harness | `unknown` — balance lookup is not supported | DSH can use different providers and accounts; a DeepSeek key does not identify the active account |
 | Grok Build | `GET cli-chat-proxy.grok.com/v1/billing` — what `/usage` calls; **experimental** | `grok login` session in `~/.grok/auth.json`; `[quota] experimental = true` |
 | Claude Code | `GET api.anthropic.com/api/oauth/usage` — what `/usage` calls; **experimental** | `claude auth login` OAuth; `[quota] experimental = true` |
 | Antigravity, Cursor, OpenCode, Devin, others | — | always `unknown` with the reason in `detail` |

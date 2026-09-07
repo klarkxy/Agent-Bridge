@@ -126,11 +126,12 @@ lose that last window. A turn whose worker stays silent past `stall_timeout_sec`
 ### Remaining quota
 
 Each `list_agents` row carries `quota`: `status` ok / exhausted / unknown, the
-CLI's rolling windows with `remaining_percent` and `resets_at`, and a `balance`
-for pay-as-you-go workers. Codex (app-server), Kimi Code (`kimi login`) and
-DeepSeek (`DEEPSEEK_API_KEY`) are read out of the box; Grok Build and Claude
+CLI's rolling windows with `remaining_percent` and `resets_at`, and an optional
+`balance` when supported. Codex (app-server) and Kimi Code (`kimi login`)
+are read out of the box; Grok Build and Claude
 Code sit behind `[quota] experimental = true`; everything else answers
-`unknown` with the reason. Bridge reports, it does not route — the coordinator
+`unknown` with the reason. DSH balance lookup is not supported because its
+active provider and account can vary. Bridge reports, it does not route — the coordinator
 weighs it against your instructions. Lookups are bounded by `[quota]
 timeout_sec` and cached for `cache_sec`; `agent-bridge --quota` prints a fresh
 reading. Details: [SETUP.md](SETUP.md#remaining-quota-in-list_agents).
@@ -269,10 +270,10 @@ Worker 静默超过 `stall_timeout_sec`（默认 1800 秒，可按 Worker 设置
 ### 剩余额度
 
 `list_agents` 每一行都带 `quota`：`status` 为 ok / exhausted / unknown，各个滚动窗口的
-`remaining_percent` 和 `resets_at`（重置时间），按量付费的 Worker 给 `balance`。
-Codex（app-server）、Kimi Code（`kimi login`）、DeepSeek（`DEEPSEEK_API_KEY`）
+`remaining_percent` 和 `resets_at`（重置时间），支持时还可提供 `balance`。
+Codex（app-server）、Kimi Code（`kimi login`）
 开箱即读；Grok Build 和 Claude Code 需要 `[quota] experimental = true`；其余 Worker
-返回 `unknown` 并附原因。Bridge 只报告、不路由——协调者结合你的 instructions 自己权衡。
+返回 `unknown` 并附原因。DSH 的供应商和账户可以变化，暂不支持余额查询。Bridge 只报告、不路由——协调者结合你的 instructions 自己权衡。
 每次查询受 `[quota] timeout_sec` 限制并缓存 `cache_sec` 秒；`agent-bridge --quota`
 可以打印一份不走缓存的读数。细节见 [SETUP.md](SETUP.md#remaining-quota-in-list_agents)。
 

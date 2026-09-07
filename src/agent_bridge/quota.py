@@ -98,8 +98,7 @@ def summarize_quota(
     """Build an ``ok`` / ``exhausted`` status from parsed windows and balance.
 
     ``exhausted`` is set when any window is fully used or the caller says the
-    account is blocked (DeepSeek ``is_available: false``, Codex
-    ``rateLimitReachedType``). Nothing parsed at all is ``unknown``: an empty
+    account is blocked (Codex ``rateLimitReachedType``). Nothing parsed at all is ``unknown``: an empty
     answer is not evidence of a full quota.
     """
     if not windows and balance is None:
@@ -458,19 +457,17 @@ async def _fetch_quota(
 def default_providers(*, experimental: bool = False) -> dict[str, QuotaProvider]:
     """Provider table. Imported lazily so ``quota`` stays import-light for tests.
 
-    Codex, Kimi Code and DeepSeek use documented or CLI-official paths. Grok
+    Codex and Kimi Code use documented or CLI-official paths. Grok
     Build and Claude Code only expose their plan usage through the endpoints
     their own ``/usage`` commands call; those are behind ``[quota] experimental``
     because they can change without notice.
     """
     from agent_bridge.quota_codex import fetch_codex_quota
-    from agent_bridge.quota_deepseek import fetch_dsh_quota
     from agent_bridge.quota_kimi import fetch_kimi_quota
 
     table: dict[str, QuotaProvider] = {
         "protocol:codex": fetch_codex_quota,
         "kimi": fetch_kimi_quota,
-        "dsh": fetch_dsh_quota,
     }
     if experimental:
         from agent_bridge.quota_claude import fetch_claude_quota
