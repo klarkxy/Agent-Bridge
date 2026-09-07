@@ -333,6 +333,53 @@ Instances share the `~/.agent-bridge` state directory but not sessions: every se
 
 Abandoned server instances self-exit: after `server.idle_exit_sec` (default 7200 s) with no MCP requests and no queued or running tasks, the process shuts its workers down and exits. Configure in `[server]` (repo `agents.toml` or `%USERPROFILE%\.agent-bridge\agents.toml`); `idle_exit_sec = 0` disables it. `list_agents` also warns when other Bridge instances are running on this machine — one per coordinator host is normal, a pile-up means a host keeps abandoning spawns.
 
+## Remaining quota in `list_agents`
+
+Every `list_agents` row carries a `quota` block so the coordinator can weigh how much plan a worker has left before dispatching — and so a worker that has run dry does not silently turn into "the coordinator does it itself" on a budget you never meant to spend:
+
+```json
+"quota": {
+  "status": "ok",
+  "windows": [
+    {"name": "5h", "remaining_percent": 82.0, "resets_at": "2026-09-07T05:00:00+00:00", "resets_in_sec": 9120},
+    {"name": "weekly", "remaining_percent": 61.5, "resets_at": "2026-09-11T00:00:00+00:00", "resets_in_sec": 331200}
+  ],
+  "balance": null,
+  "plan": "plus",
+  "source": "codex app-server account/rateLimits/read",
+  "fetched_at": "2026-09-07T02:28:00+00:00",
+  "cached": false,
+  "stale": false,
+  "detail": null
+}
+```
+
+- `status` is `ok`, `exhausted` (a window is fully used, or the account is blocked), or `unknown`. `unknown` means Bridge could not read the number — the reason is in `detail` — and never that the quota is empty. Quota does not change `available`, and Bridge does not route on it: the rulebook tells the coordinator to treat it as information next to your `[coordinator] instructions`.
+- `windows[]` are the CLI's rolling limits; `balance` is for pay-as-you-go workers; `cached` means the reading was reused from the last lookup, `stale` that a fresh lookup failed and the last good reading is shown instead.
+
+Where each number comes from:
+
+| Worker | Source | Needs |
+| --- | --- | --- |
+| Codex CLI | `codex app-server` → `account/rateLimits/read` (5h + weekly, plan, credits) | ChatGPT sign-in (`codex login`); API-key logins have no plan quota |
+| Kimi Code | `GET <Kimi Code base_url>/usages` — the same call the interactive `/usage` makes | `kimi login` (OAuth); Moonshot API-key sessions answer `unknown` |
+| DeepSeek Harness | `GET https://api.deepseek.com/user/balance` (balance + `is_available`) | `DEEPSEEK_API_KEY` in `[env.set]` or the process environment |
+| Grok Build | `GET cli-chat-proxy.grok.com/v1/billing` — what `/usage` calls; **experimental** | `grok login` session in `~/.grok/auth.json`; `[quota] experimental = true` |
+| Claude Code | `GET api.anthropic.com/api/oauth/usage` — what `/usage` calls; **experimental** | `claude auth login` OAuth; `[quota] experimental = true` |
+| Antigravity, Cursor, OpenCode, Devin, others | — | always `unknown` with the reason in `detail` |
+
+Bridge reads credential files the CLIs already wrote; it never refreshes or rewrites them. Tune it in `[quota]` (repo `agents.toml` or `%USERPROFILE%\.agent-bridge\agents.toml`):
+
+```toml
+[quota]
+enabled = true        # false: every row answers unknown, nothing is spawned
+timeout_sec = 4       # one worker's lookup is cut off after this
+cache_sec = 300       # a reading is reused for this long
+experimental = false  # also read Grok Build / Claude Code private endpoints
+```
+
+A task that fails with a quota-looking error (`quota`, `rate limit`, `insufficient balance`, …) drops that worker's cached reading so the next `list_agents` re-reads it. `agent-bridge --quota` prints a fresh reading for every worker without the cache — use it when a row says `unknown` and you want to see why.
+
 ## Orchestration rules
 
 The coordinator learns how to drive the Bridge through three channels; [ORCHESTRATION.md](ORCHESTRATION.md) is the source of truth for all of them ([ORCHESTRATION.zh-CN.md](ORCHESTRATION.zh-CN.md) is the human-readable translation):
