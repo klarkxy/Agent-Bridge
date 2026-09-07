@@ -628,3 +628,195 @@ async def test_describe_quotas_covers_every_agent(monkeypatch):
 
 def test_far_future_fixture_is_actually_in_the_future():
     assert datetime.fromtimestamp(FAR_FUTURE, tz=UTC) > datetime.now(UTC) + timedelta(days=365)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stale", [False, True])
+async def test_cached_countdown_advances_without_mutating_reading(monkeypatch, stale):
+    now = datetime(2099, 12, 31, 23, 59, tzinfo=UTC)
+    original = QuotaStatus(status="ok", windows=[window_from_reset("5h", 50, FAR_FUTURE, now=now)])
+    cache = QuotaCache(300)
+    cache.put("fake", original)
+    if stale:
+        cache.invalidate("fake")
+
+    async def broken(cfg, env):
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr("agent_bridge.quota.utcnow", lambda: now + timedelta(seconds=20))
+    row = await fetch_quota(_agent(), {}, cache=cache, timeout_sec=1, providers={"fake": broken})
+    assert row["windows"][0]["resets_in_sec"] == 40
+    assert row["stale"] is stale
+    monkeypatch.setattr("agent_bridge.quota.utcnow", lambda: now + timedelta(seconds=70))
+    row = await fetch_quota(_agent(), {}, cache=cache, timeout_sec=1, providers={"fake": broken})
+    assert row["windows"][0]["resets_in_sec"] == 0
+    assert original.windows[0].resets_in_sec == 60
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [False, True])
+async def test_concurrent_fetches_share_read_and_isolate_cancellation(failure):
+    started, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def provider(cfg, env):
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        if failure:
+            raise RuntimeError("offline")
+        return QuotaStatus(status="ok")
+
+    cache = QuotaCache(300)
+
+    async def fetch():
+        return await fetch_quota(_agent(), {}, cache=cache, timeout_sec=1, providers={"fake": provider})
+
+    first = asyncio.create_task(fetch())
+    await started.wait()
+    second = asyncio.create_task(fetch())
+    await asyncio.sleep(0)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    release.set()
+    result = await second
+    assert result["status"] == ("unknown" if failure else "ok")
+    assert calls == 1
+    assert (await fetch())["cached"] is True
+    assert calls == 1
+    await cache.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("clear", [False, True])
+async def test_invalidation_during_read_cannot_restore_old_cache(clear):
+    started, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def provider(cfg, env):
+        nonlocal calls
+        calls += 1
+        number = calls
+        if number == 1:
+            started.set()
+            await release.wait()
+        return QuotaStatus(status="ok", plan=str(number))
+
+    cache = QuotaCache(300)
+
+    async def fetch():
+        return await fetch_quota(_agent(), {}, cache=cache, timeout_sec=1, providers={"fake": provider})
+
+    old = asyncio.create_task(fetch())
+    await started.wait()
+    if clear:
+        cache.clear()
+    else:
+        cache.invalidate("fake")
+    assert (await fetch())["plan"] == "2"
+    release.set()
+    assert (await old)["plan"] == "1"
+    assert (await fetch())["plan"] == "2"
+    assert cache.last_good("fake").plan == "2"
+    await cache.close()
+
+
+@pytest.mark.asyncio
+async def test_disabled_cli_does_not_prepare_or_query_workers(monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("disabled quota must not prepare a lookup")
+
+    monkeypatch.setattr("agent_bridge.quota.provider_table", forbidden)
+    monkeypatch.setattr("agent_bridge.probes.command_exists", forbidden)
+    monkeypatch.setattr("agent_bridge.worker_env.build_worker_env", forbidden)
+    config = AppConfig(agents={"fake": _agent(), "ghost": _agent("ghost", "acp")}, quota=QuotaConfig(enabled=False))
+    rows = await describe_quotas(config)
+    assert set(rows) == {"fake", "ghost"}
+    for row in rows.values():
+        assert row["status"] == "unknown"
+        assert "disabled" in row["detail"]
+
+
+@pytest.mark.asyncio
+async def test_cli_command_check_uses_global_codex_environment(monkeypatch):
+    from agent_bridge.config import EnvConfig
+
+    def resolve(command, fallbacks=None, *, env=None):
+        if env.get("CODEX_CLI_PATH") != "configured-codex":
+            raise FileNotFoundError("missing configured Codex")
+        return [env["CODEX_CLI_PATH"]]
+
+    async def provider(cfg, env):
+        assert env["CODEX_CLI_PATH"] == "configured-codex"
+        return QuotaStatus(status="ok")
+
+    monkeypatch.setattr("agent_bridge.probes.resolve_codex_command", resolve)
+    monkeypatch.setattr("agent_bridge.quota.provider_table", lambda config: {"protocol:codex": provider})
+    config = AppConfig(
+        agents={"codex-alt": _agent("codex-alt", "codex")},
+        env=EnvConfig(discover_proxy=False, inherit=[], set={"CODEX_CLI_PATH": "configured-codex"}),
+    )
+    assert (await describe_quotas(config))["codex-alt"]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answered", [False, True])
+async def test_codex_timeout_returns_before_resistant_child_cleanup(monkeypatch, answered):
+    import os
+
+    from agent_bridge import processes
+
+    # A real subprocess; suppress the first termination signal to model a
+    # resistant child portably, including Windows where SIGTERM is a hard kill.
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import time; time.sleep(60)",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    real_kill = processes.kill_tree
+    signals = []
+
+    def resist(pid, handle=None, *, force=False):
+        if pid == proc.pid:
+            signals.append(force)
+            if not force:
+                return
+        real_kill(pid, handle=handle, force=force)
+
+    async def spawn(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(processes, "kill_tree", resist)
+    monkeypatch.setattr("agent_bridge.quota_codex.asyncio.create_subprocess_exec", spawn)
+    monkeypatch.setattr("agent_bridge.quota_codex.resolve_codex_command", lambda *args, **kwargs: [sys.executable])
+    if answered:
+
+        async def response(*args):
+            return {"rateLimits": {}}
+
+        monkeypatch.setattr("agent_bridge.quota_codex._read_response", response)
+        monkeypatch.setattr("agent_bridge.quota_codex.POST_INIT_SETTLE_SEC", 0)
+    cache = QuotaCache(60)
+    try:
+        start = time.monotonic()
+        row = await fetch_quota(
+            _agent("codex", "codex"),
+            dict(os.environ),
+            cache=cache,
+            timeout_sec=0.1,
+            providers={"protocol:codex": fetch_codex_quota},
+        )
+        assert time.monotonic() - start < 0.6
+        assert row["status"] == "unknown" and "timed out" in row["detail"]
+        # Closing must not cancel the cancellation cleanup a second time.
+        await asyncio.wait_for(cache.close(), timeout=6)
+        assert proc.returncode is not None
+        assert signals == [False, True]
+    finally:
+        real_kill(proc.pid, handle=proc, force=True)
+        await proc.wait()

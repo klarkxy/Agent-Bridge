@@ -149,7 +149,14 @@ async def read_codex_rate_limits(command: list[str], env: Mapping[str, str]) -> 
         await _send(proc, {"jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read", "params": {}})
         return await _read_response(proc, 2)
     finally:
-        await reap_subprocess(proc, timeout=2.0)
+        cleanup = asyncio.create_task(reap_subprocess(proc, timeout=2.0))
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            # A deadline can arrive after a successful response, while this
+            # finally block is already reaping. Finish its kill escalation.
+            await cleanup
+            raise
 
 
 async def fetch_codex_quota(cfg: AgentConfig, env: Mapping[str, str]) -> QuotaStatus:

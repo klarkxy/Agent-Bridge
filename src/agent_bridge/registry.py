@@ -339,6 +339,7 @@ class Registry:
 
     async def stop(self) -> None:
         self._stopping = True
+        await self._quota_cache.close()
         watchdog = self._watchdog
         self._watchdog = None
         if watchdog is not None:

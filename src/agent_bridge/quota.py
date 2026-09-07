@@ -275,6 +275,27 @@ class QuotaCache:
         self.ttl_sec = max(float(ttl_sec), 0.0)
         self._fresh: dict[str, tuple[float, QuotaStatus]] = {}
         self._last_good: dict[str, QuotaStatus] = {}
+        self._inflight: dict[str, asyncio.Task[QuotaStatus]] = {}
+        self._pending: set[asyncio.Task[QuotaStatus]] = set()
+
+    def track(self, task: asyncio.Task[QuotaStatus]) -> None:
+        self._pending.add(task)
+        task.add_done_callback(self._finished)
+
+    def _finished(self, task: asyncio.Task[QuotaStatus]) -> None:
+        self._pending.discard(task)
+        if not task.cancelled():
+            task.exception()  # Retrieve failures even when every caller has left.
+
+    async def close(self) -> None:
+        """Cancel outstanding reads and let subprocess cleanup finish once."""
+        while self._pending:
+            pending = list(self._pending)
+            for task in pending:
+                if not task.done() and not task.cancelling():
+                    task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._inflight.clear()
 
     def get(self, name: str, *, now: float | None = None) -> QuotaStatus | None:
         entry = self._fresh.get(name)
@@ -298,14 +319,23 @@ class QuotaCache:
 
     def invalidate(self, name: str) -> None:
         self._fresh.pop(name, None)
+        # Old callers may finish, but new callers must start a fresh reading.
+        self._inflight.pop(name, None)
 
     def clear(self) -> None:
         self._fresh.clear()
         self._last_good.clear()
+        self._inflight.clear()
 
 
 def _dump(status: QuotaStatus) -> dict[str, Any]:
-    return status.model_dump(mode="json")
+    row = status.model_dump(mode="json")
+    now = utcnow()
+    for window in row["windows"]:
+        resets = parse_timestamp(window["resets_at"])
+        if resets is not None:
+            window["resets_in_sec"] = max(int((resets - now).total_seconds()), 0)
+    return row
 
 
 def _stale_or_unknown(cache: QuotaCache, name: str, reason: str, source: str | None) -> QuotaStatus:
@@ -357,28 +387,64 @@ async def fetch_quota(
     if hit is not None:
         return _dump(hit.model_copy(update={"cached": True}))
 
+    task = cache._inflight.get(cfg.name)
+    if task is None:
+
+        async def lookup() -> QuotaStatus:
+            try:
+                status = await _fetch_quota(cfg, env, cache, timeout_sec, providers)
+                if cache._inflight.get(cfg.name) is asyncio.current_task():
+                    ttl = cache.ttl_sec
+                    if status.status == "unknown" or status.stale:
+                        ttl = min(ttl, FAILURE_CACHE_SEC)
+                    cache.put(cfg.name, status, ttl_sec=ttl)
+                return status
+            finally:
+                if cache._inflight.get(cfg.name) is asyncio.current_task():
+                    cache._inflight.pop(cfg.name, None)
+
+        task = asyncio.create_task(lookup())
+        cache._inflight[cfg.name] = task
+        cache.track(task)
+    # One cancelled listing must not cancel a read shared with another caller.
+    return _dump(await asyncio.shield(task))
+
+
+async def _fetch_quota(
+    cfg: AgentConfig,
+    env: Mapping[str, str],
+    cache: QuotaCache,
+    timeout_sec: float,
+    providers: Mapping[str, QuotaProvider] | None,
+) -> QuotaStatus:
     table = default_providers() if providers is None else providers
     provider = resolve_provider(cfg, table)
     if provider is None:
-        status = unknown_quota(f"quota lookup is not supported for {cfg.name}")
-        cache.put(cfg.name, status)
-        return _dump(status)
+        return unknown_quota(f"quota lookup is not supported for {cfg.name}")
 
     source = getattr(provider, "quota_source", None)
+
+    async def invoke() -> QuotaStatus:
+        return await provider(cfg, env)
+
+    read = asyncio.create_task(invoke())
+    cache.track(read)
     try:
-        status = await asyncio.wait_for(provider(cfg, env), timeout=timeout_sec)
-    except TimeoutError:
-        log.info("quota lookup for %s timed out after %.1fs", cfg.name, timeout_sec)
-        status = _stale_or_unknown(cache, cfg.name, f"quota lookup timed out after {timeout_sec:g}s", source)
-        cache.put(cfg.name, status, ttl_sec=min(cache.ttl_sec, FAILURE_CACHE_SEC))
-        return _dump(status)
+        done, _ = await asyncio.wait({read}, timeout=timeout_sec)
+        if not done:
+            # Cancellation cleanup continues in the tracked provider task;
+            # list_agents need not wait for terminate/kill grace periods.
+            log.info("quota lookup for %s timed out after %.1fs", cfg.name, timeout_sec)
+            return _stale_or_unknown(cache, cfg.name, f"quota lookup timed out after {timeout_sec:g}s", source)
+        status = read.result()
     except asyncio.CancelledError:
         raise
     except Exception as exc:
         log.info("quota lookup for %s failed: %s: %s", cfg.name, type(exc).__name__, exc)
-        status = _stale_or_unknown(cache, cfg.name, f"quota lookup failed: {type(exc).__name__}: {exc}", source)
-        cache.put(cfg.name, status, ttl_sec=min(cache.ttl_sec, FAILURE_CACHE_SEC))
-        return _dump(status)
+        return _stale_or_unknown(cache, cfg.name, f"quota lookup failed: {type(exc).__name__}: {exc}", source)
+    finally:
+        if not read.done() and not read.cancelling():
+            read.cancel()
 
     if status.status not in QUOTA_STATUSES:
         status = status.model_copy(update={"status": "unknown"})
@@ -386,9 +452,7 @@ async def fetch_quota(
         status = status.model_copy(update={"fetched_at": iso()})
     if status.source is None and source:
         status = status.model_copy(update={"source": source})
-    ttl = cache.ttl_sec if status.status != "unknown" else min(cache.ttl_sec, FAILURE_CACHE_SEC)
-    cache.put(cfg.name, status, ttl_sec=ttl)
-    return _dump(status)
+    return status
 
 
 def default_providers(*, experimental: bool = False) -> dict[str, QuotaProvider]:
@@ -447,13 +511,21 @@ async def describe_quotas(config: AppConfig, *, bypass_cache: bool = True) -> di
     from agent_bridge.probes import command_exists
     from agent_bridge.worker_env import build_worker_env
 
+    if not config.quota.enabled:
+        return {
+            name: _dump(unknown_quota("quota lookup is disabled ([quota] enabled = false)")) for name in config.agents
+        }
+
     cache = QuotaCache(0.0 if bypass_cache else config.quota.cache_sec)
     table = provider_table(config)
 
     async def one(cfg: AgentConfig) -> tuple[str, dict[str, Any]]:
-        if not await asyncio.to_thread(command_exists, cfg):
+        try:
+            env = await asyncio.to_thread(build_worker_env, cfg.env, config=config.env, log_fill=False)
+        except Exception as exc:
+            return cfg.name, _dump(unknown_quota(f"worker environment unavailable: {type(exc).__name__}"))
+        if not await asyncio.to_thread(command_exists, cfg, env=env):
             return cfg.name, _dump(unknown_quota("worker command not found"))
-        env = await asyncio.to_thread(build_worker_env, cfg.env, config=config.env, log_fill=False)
         return cfg.name, await fetch_quota(
             cfg,
             env,
@@ -462,5 +534,8 @@ async def describe_quotas(config: AppConfig, *, bypass_cache: bool = True) -> di
             providers=table,
         )
 
-    rows = await asyncio.gather(*(one(cfg) for cfg in config.agents.values()))
-    return dict(rows)
+    try:
+        rows = await asyncio.gather(*(one(cfg) for cfg in config.agents.values()))
+        return dict(rows)
+    finally:
+        await cache.close()
