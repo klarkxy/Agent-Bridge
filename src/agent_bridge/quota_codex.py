@@ -113,7 +113,7 @@ async def _read_response(proc: asyncio.subprocess.Process, wanted_id: int) -> Ma
         if "error" in message:
             error = _error_text(message["error"])
             lowered = error.lower()
-            if "token_invalidated" in lowered or "401" in lowered or "unauthorized" in lowered:
+            if any(mark in lowered for mark in ("token_invalidated", "401", "unauthorized", "authentication required")):
                 raise RuntimeError(f"codex is not signed in ({error}); run `codex login`")
             raise RuntimeError(f"codex app-server error: {error}")
         result = message.get("result")
