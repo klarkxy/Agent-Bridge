@@ -16,6 +16,7 @@ from agent_bridge.adapters import build_adapter
 from agent_bridge.adapters.base import Adapter
 from agent_bridge.config import (
     COORDINATOR_MODE_HINTS,
+    AgentConfig,
     AppConfig,
     load_config,
     normalize_coordinator_mode,
@@ -37,6 +38,7 @@ from agent_bridge.paths import ensure_home, result_path, state_path, transcript_
 from agent_bridge.persist import atomic_write_json, atomic_write_text, read_json
 from agent_bridge.probes import probe_agent
 from agent_bridge.processes import count_sibling_servers, owner_alive, process_create_time, reap_orphans
+from agent_bridge.quota import QuotaCache, fetch_quota, looks_like_quota_error, provider_table, unknown_quota
 from agent_bridge.transcript import (
     append_event,
     flush_pending,
@@ -49,7 +51,7 @@ from agent_bridge.transcript import (
     recent_activity,
     worker_silence_sec,
 )
-from agent_bridge.worker_env import describe_env, install_host_env, is_worker_context
+from agent_bridge.worker_env import build_worker_env, describe_env, install_host_env, is_worker_context
 from agent_bridge.workspace import merge_files_changed, snapshot_workspace
 
 log = logging.getLogger(__name__)
@@ -140,6 +142,7 @@ class Registry:
         self.runtime_context = _resolve_runtime_context(runtime_context)
         self.dispatch_enabled = self.runtime_context == "coordinator"
         self._sibling_cache: tuple[float, int] | None = None
+        self._quota_cache = QuotaCache(config.quota.cache_sec)
         self._stopping = False
         self._pending_state: dict[str, list[dict]] | None = None
         self._flush_task: asyncio.Task[None] | None = None
@@ -386,8 +389,32 @@ class Registry:
         return None
 
     async def list_agents(self) -> list[dict]:
-        probes = [probe_agent(cfg, self.config.env) for cfg in self.config.agents.values()]
-        return list(await asyncio.gather(*probes))
+        async def describe(cfg: AgentConfig) -> dict:
+            row = await probe_agent(cfg, self.config.env)
+            row["quota"] = await self._quota_for(cfg, available=bool(row.get("available")))
+            return row
+
+        return list(await asyncio.gather(*(describe(cfg) for cfg in self.config.agents.values())))
+
+    async def _quota_for(self, cfg: AgentConfig, *, available: bool) -> dict:
+        """The ``quota`` block for one ``list_agents`` row. Never raises, never gates ``available``."""
+        quota_cfg = self.config.quota
+        if not quota_cfg.enabled:
+            return unknown_quota("quota lookup is disabled ([quota] enabled = false)").model_dump(mode="json")
+        if not available:
+            return unknown_quota("worker command not found").model_dump(mode="json")
+        try:
+            env = await asyncio.to_thread(build_worker_env, cfg.env, config=self.config.env, log_fill=False)
+        except Exception as exc:
+            log.warning("could not build the worker env for %s quota lookup: %s", cfg.name, exc)
+            return unknown_quota(f"worker environment unavailable: {type(exc).__name__}").model_dump(mode="json")
+        return await fetch_quota(
+            cfg,
+            env,
+            cache=self._quota_cache,
+            timeout_sec=quota_cfg.timeout_sec,
+            providers=provider_table(self.config),
+        )
 
     SIBLING_CACHE_SEC = 60
 
@@ -672,6 +699,12 @@ class Registry:
                     await watch
             if task.finished_at is None:
                 task.finished_at = iso()
+            # A Kimi quota failure arrives as a warning on a "completed" turn.
+            if (task.status == TaskStatus.failed and looks_like_quota_error(task.error)) or any(
+                looks_like_quota_error(w) for w in task.warnings
+            ):
+                # The cached "ok" is now a lie; make the next list_agents re-read it.
+                self._quota_cache.invalidate(session.agent)
             session.last_active_at = iso()
             if session.proc_state != ProcState.dead:
                 session.proc_state = ProcState.ready if adapter.resident else ProcState.idle_unloaded

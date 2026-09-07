@@ -26,6 +26,17 @@
 # instructions = """Research goes to antigravity. Coding goes to grok.
 # Long single-file ports go to kimi (k3-256k)."""
 
+# Remaining quota returned with each list_agents row (agents[].quota).
+# Bridge only reports it; routing stays with the coordinator and your
+# instructions. Workers Bridge cannot query answer status = "unknown".
+# experimental = true also reads the private endpoints Grok Build's and
+# Claude Code's own /usage commands call (OAuth login only).
+# [quota]
+# enabled = true
+# timeout_sec = 4
+# cache_sec = 300
+# experimental = false
+
 # Optional. Only if a worker actually reads that variable from the process
 # environment. DSH credentials usually live in ~/.dsh/.credentials.yaml.
 # [env.set]

@@ -83,6 +83,23 @@ mode = "auto"
 # Never dispatch test runs; run them yourself."""
 instructions = ""
 
+[quota]
+# Remaining quota returned with every list_agents row as agents[].quota:
+# status ok | exhausted | unknown, rolling windows with remaining_percent and
+# resets_at, and a balance for pay-as-you-go accounts. Bridge does not route
+# on it; the coordinator weighs it against [coordinator] instructions.
+# Supported today: codex (app-server rate limits), kimi (Kimi Code OAuth
+# login), dsh (DEEPSEEK_API_KEY balance). Others answer status = "unknown".
+enabled = true
+# One worker's lookup is cut off after this many seconds; list_agents never
+# waits longer than the slowest probe plus this.
+timeout_sec = 4
+# A reading is reused for this long before the CLI is asked again.
+cache_sec = 300
+# Grok Build and Claude Code only expose plan usage through the private
+# endpoints their own /usage commands call. Opt in; they may change.
+experimental = false
+
 [agents.grok]
 protocol = "acp"
 command = ["grok", "--no-auto-update", "agent", "--always-approve", "--no-leader", "stdio"]

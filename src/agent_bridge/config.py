@@ -91,6 +91,21 @@ class ServerConfig(BaseModel):
     idle_exit_sec: int = 7200
 
 
+class QuotaConfig(BaseModel):
+    """Remaining-quota lookup that rides along with ``list_agents``.
+
+    ``timeout_sec`` bounds one worker's lookup; ``cache_sec`` is how long a
+    reading is reused before the CLI is asked again. ``experimental`` unlocks
+    the workers whose only quota source is the private endpoint their own
+    ``/usage`` command calls (Grok Build, Claude Code).
+    """
+
+    enabled: bool = True
+    timeout_sec: float = Field(default=4.0, gt=0)
+    cache_sec: float = Field(default=300.0, ge=0)
+    experimental: bool = False
+
+
 COORDINATOR_MODES = ("manual", "auto", "eager")
 # The notes that inspired this used safe/yolo; yolo already means
 # "auto-approve tool calls" for Kimi and Grok, so the canonical names differ.
@@ -142,6 +157,7 @@ class AppConfig(BaseModel):
     env: EnvConfig = Field(default_factory=EnvConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)
     coordinator: CoordinatorConfig = Field(default_factory=CoordinatorConfig)
+    quota: QuotaConfig = Field(default_factory=QuotaConfig)
     warnings: list[str] = Field(default_factory=list)
 
     def get(self, name: str) -> AgentConfig:
@@ -220,6 +236,22 @@ def _coerce_server(raw: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if "idle_exit_sec" in block and block["idle_exit_sec"] is not None:
         out["idle_exit_sec"] = int(block["idle_exit_sec"])
+    return out
+
+
+def _coerce_quota(raw: dict[str, Any]) -> dict[str, Any]:
+    block = raw.get("quota")
+    if not isinstance(block, dict):
+        return {}
+    out: dict[str, Any] = {}
+    if block.get("enabled") is not None:
+        out["enabled"] = bool(block["enabled"])
+    if block.get("timeout_sec") is not None:
+        out["timeout_sec"] = float(block["timeout_sec"])
+    if block.get("cache_sec") is not None:
+        out["cache_sec"] = float(block["cache_sec"])
+    if block.get("experimental") is not None:
+        out["experimental"] = bool(block["experimental"])
     return out
 
 
@@ -370,7 +402,7 @@ def load_config(home: Path | None = None) -> AppConfig:
             f"{overlay_path} is not valid TOML: {exc}. "
             "Fix or delete the file, then restart the Bridge."
         ) from exc
-    supported_sections = {"agents", "env", "server", "coordinator"}
+    supported_sections = {"agents", "env", "server", "coordinator", "quota"}
     unsupported = sorted(set(overlay_raw) - supported_sections)
     warnings = []
     if unsupported:
@@ -406,10 +438,12 @@ def load_config(home: Path | None = None) -> AppConfig:
         coord_raw["mode"] = env_mode
     coord_raw["mode"] = normalize_coordinator_mode(coord_raw.get("mode"))
     coordinator = CoordinatorConfig.model_validate(coord_raw)
+    quota = QuotaConfig.model_validate({**_coerce_quota(bundled_raw), **_coerce_quota(overlay_raw)})
     return AppConfig(
         agents=agents,
         env=env,
         server=server,
         coordinator=coordinator,
+        quota=quota,
         warnings=warnings,
     )
