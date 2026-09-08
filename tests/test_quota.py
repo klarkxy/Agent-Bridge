@@ -90,6 +90,29 @@ def test_summarize_quota_marks_exhausted_and_refuses_empty_answers():
     assert empty.status == "unknown" and empty.detail == "nothing here"
 
 
+@pytest.mark.parametrize(
+    ("parse", "payload"),
+    [
+        (parse_codex_rate_limits, {"rateLimits": {"primary": {}}}),
+        (parse_kimi_usage, {"usage": {}}),
+        (parse_claude_usage, {"five_hour": {}}),
+        (parse_kimi_usage, {"usage": {"reset_at": "2030-01-01T00:00:00Z"}}),
+    ],
+)
+def test_empty_quota_windows_are_unknown(parse, payload):
+    status = parse(payload)
+    assert status.status == "unknown"
+    assert status.detail
+
+
+def test_partial_quota_keeps_known_windows_balance_and_explicit_exhaustion():
+    missing = QuotaWindow(name="5h")
+    assert summarize_quota([missing, QuotaWindow(name="weekly", remaining_percent=40)]).status == "ok"
+    assert summarize_quota([missing, QuotaWindow(name="weekly", remaining_percent=0)]).status == "exhausted"
+    assert summarize_quota([missing], balance=QuotaBalance(amount="unlimited")).status == "ok"
+    assert summarize_quota([missing], exhausted=True).status == "exhausted"
+
+
 def test_looks_like_quota_error():
     assert looks_like_quota_error("quota exceeded")
     assert looks_like_quota_error("HTTP 429 Rate limit reached")

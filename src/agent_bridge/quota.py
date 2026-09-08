@@ -17,13 +17,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import ssl
 import time
-import urllib.error
-import urllib.request
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
+from urllib.request import proxy_bypass_environment  # type: ignore[attr-defined]  # Missing from Windows typeshed.
 
+import httpx2
 from pydantic import BaseModel, Field
 
 from agent_bridge.config import AgentConfig, AppConfig
@@ -98,10 +100,10 @@ def summarize_quota(
     """Build an ``ok`` / ``exhausted`` status from parsed windows and balance.
 
     ``exhausted`` is set when any window is fully used or the caller says the
-    account is blocked (Codex ``rateLimitReachedType``). Nothing parsed at all is ``unknown``: an empty
-    answer is not evidence of a full quota.
+    account is blocked (Codex ``rateLimitReachedType``). Without a percentage,
+    balance or explicit exhaustion signal, the answer is ``unknown``.
     """
-    if not windows and balance is None:
+    if not exhausted and balance is None and not any(window.remaining_percent is not None for window in windows):
         return unknown_quota(detail or "no quota data in the response", source=source)
     dry = exhausted or any(
         window.remaining_percent is not None and window.remaining_percent <= 0 for window in windows
@@ -235,23 +237,6 @@ def _proxy_map(env: Mapping[str, str]) -> dict[str, str]:
     return proxies
 
 
-def _get_json_sync(url: str, headers: Mapping[str, str], env: Mapping[str, str], timeout: float) -> Any:
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler(_proxy_map(env)))
-    request = urllib.request.Request(url, headers={"Accept": "application/json", **headers})
-    try:
-        with opener.open(request, timeout=timeout) as response:
-            raw = response.read()
-    except urllib.error.HTTPError as exc:
-        body = ""
-        try:
-            body = exc.read().decode("utf-8", errors="replace")
-        except (OSError, ValueError):
-            body = ""
-        message = body.strip().replace("\n", " ")[:160]
-        raise QuotaHTTPError(exc.code, message) from None
-    return json.loads(raw.decode("utf-8"))
-
-
 async def get_json(
     url: str,
     *,
@@ -259,12 +244,36 @@ async def get_json(
     env: Mapping[str, str] | None = None,
     timeout: float = 10.0,
 ) -> Any:
-    """GET a JSON document through the worker's proxy settings, off the loop.
+    """GET JSON through the worker's proxies with cancellable network I/O.
 
-    Standard library only: quota lookups must not add a runtime dependency.
-    Auth headers are passed in by the caller and never logged here.
+    A quota deadline must close the request, not leave a blocking HTTP thread
+    that ``asyncio.run`` waits for when the CLI exits. Reuse MCP's HTTP client
+    dependency. Auth headers are passed by the caller and never logged here.
     """
-    return await asyncio.to_thread(_get_json_sync, url, headers or {}, env or {}, timeout)
+    worker_env = env or {}
+    tls = ssl.create_default_context(
+        cafile=worker_env.get("SSL_CERT_FILE") or None,
+        capath=worker_env.get("SSL_CERT_DIR") or None,
+    )
+    proxies = _proxy_map(worker_env)
+    if proxy_bypass_environment(
+        urlsplit(url).netloc, {"no": worker_env.get("NO_PROXY") or worker_env.get("no_proxy") or ""},
+    ):
+        proxies = {}
+    mounts = {
+        f"{scheme}://": httpx2.AsyncHTTPTransport(proxy=proxy, verify=tls, trust_env=False)
+        for scheme, proxy in proxies.items()
+    }
+    async with httpx2.AsyncClient(
+        mounts=mounts, verify=tls, trust_env=False, timeout=timeout, follow_redirects=True,
+    ) as client:
+        response = await client.get(url, headers={"Accept": "application/json", **(headers or {})})
+        try:
+            response.raise_for_status()
+        except httpx2.HTTPStatusError:
+            message = response.content.decode("utf-8", errors="replace").strip().replace("\n", " ")[:160]
+            raise QuotaHTTPError(response.status_code, message) from None
+        return json.loads(response.content.decode("utf-8"))
 
 
 class QuotaCache:
