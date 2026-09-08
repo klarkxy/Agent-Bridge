@@ -4,7 +4,6 @@ import asyncio
 import json
 import os
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -14,7 +13,7 @@ from agent_bridge.quota import QuotaHTTPError, get_json
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize("route", ["direct", "proxy", "bypass"])
+@pytest.mark.parametrize("route", ["direct", "proxy", "all_proxy", "bypass"])
 @pytest.mark.parametrize("status", [200, 429])
 async def test_quota_http_preserves_headers_proxy_and_errors(route, status):
     received = asyncio.get_running_loop().create_future()
@@ -32,10 +31,12 @@ async def test_quota_http_preserves_headers_proxy_and_errors(route, status):
     async with await asyncio.start_server(handle, "127.0.0.1", 0) as server:
         port = server.sockets[0].getsockname()[1]
         endpoint = f"http://127.0.0.1:{port}"
-        url = "http://quota.invalid/usages" if route == "proxy" else endpoint + "/usages"
+        url = "http://quota.invalid/usages" if route in ("proxy", "all_proxy") else endpoint + "/usages"
         env = {}
         if route == "proxy":
             env = {"HTTP_PROXY": endpoint, "HTTPS_PROXY": "http://127.0.0.1:1"}
+        elif route == "all_proxy":
+            env = {"ALL_PROXY": endpoint}
         elif route == "bypass":
             env = {"HTTP_PROXY": "http://127.0.0.1:1", "NO_PROXY": "127.0.0.1"}
         if status == 200:
@@ -48,7 +49,7 @@ async def test_quota_http_preserves_headers_proxy_and_errors(route, status):
         request = await asyncio.wait_for(received, 1)
         assert b"accept: application/json" in request.lower()
         assert b"authorization: bearer test" in request.lower()
-        target = url if route == "proxy" else "/usages"
+        target = url if route in ("proxy", "all_proxy") else "/usages"
         assert request.startswith(f"GET {target} HTTP/1.1\r\n".encode())
 
 
@@ -71,39 +72,36 @@ async def test_quota_cli_deadline_closes_http_and_exits(tmp_path, stall_stage):
             await writer.wait_closed()
             disconnected.set()
 
-    home = tmp_path / "kimi"
-    (home / "credentials").mkdir(parents=True)
-    (home / "credentials" / "kimi-code.json").write_text(
-        json.dumps({"access_token": "test-local-only", "expires_at": time.time() + 3600}), encoding="utf-8",
-    )
-    # Supply an isolated one-worker config; the CLI, provider, HTTP and shutdown
-    # paths are unchanged. No real credential or external endpoint is used.
+    # A test provider exercises the real CLI, HTTP helper and shutdown. Built-in
+    # providers correctly reject custom endpoints, so no credential bypass is used.
     script = """
 import sys
 import agent_bridge.config as config
+import agent_bridge.quota as quota
 from agent_bridge.cli import main
+async def local_http(cfg, env):
+    await quota.get_json(sys.argv[1], env={})
+    return quota.unknown_quota("unexpected response")
 c = config.AppConfig(
-    agents={'kimi': config.AgentConfig(name='kimi', protocol='acp', command=[sys.executable], env={
-        'KIMI_CODE_HOME': sys.argv[1], 'KIMI_CODE_BASE_URL': sys.argv[2],
-        'HTTP_PROXY': '', 'HTTPS_PROXY': '', 'http_proxy': '', 'https_proxy': '', 'NO_PROXY': '*',
-    })},
+    agents={'local-http': config.AgentConfig(name='local-http', protocol='acp', command=[sys.executable])},
     env=config.EnvConfig(inherit=[], discover_proxy=False),
     quota=config.QuotaConfig(timeout_sec=1.5),
 )
 config.load_config = lambda: c
+quota.provider_table = lambda config: {'local-http': quota.QuotaProvider('local test', local_http)}
 main(['--quota'])
 """
     async with await asyncio.start_server(handle, "127.0.0.1", 0) as server:
         port = server.sockets[0].getsockname()[1]
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-X", "utf8", "-c", script, str(home), f"http://127.0.0.1:{port}",
+            sys.executable, "-X", "utf8", "-c", script, f"http://127.0.0.1:{port}",
             cwd=ROOT, env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), 5)
             assert proc.returncode == 0, stderr.decode()
-            quota = json.loads(stdout)["kimi"]
+            quota = json.loads(stdout)["local-http"]
             assert quota["status"] == "unknown"
             assert "timed out after 1.5s" in quota["detail"]
             assert connected.is_set(), "the test must reach real HTTP I/O before its deadline"

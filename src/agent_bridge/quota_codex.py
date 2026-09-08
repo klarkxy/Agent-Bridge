@@ -33,6 +33,7 @@ from agent_bridge.quota import (
     window_from_reset,
     window_name_from_minutes,
 )
+from agent_bridge.quota_endpoints import quota_block_reason
 
 SOURCE = "codex app-server account/rateLimits/read"
 CLIENT_INFO = {"name": "agent-bridge", "title": "Agent Bridge", "version": "1"}
@@ -160,9 +161,8 @@ async def read_codex_rate_limits(command: list[str], env: Mapping[str, str]) -> 
 
 
 async def fetch_codex_quota(cfg: AgentConfig, env: Mapping[str, str]) -> QuotaStatus:
+    if reason := quota_block_reason(cfg, env):
+        return unknown_quota(reason, source=SOURCE)
     command = await asyncio.to_thread(resolve_codex_command, cfg.command, cfg.fallback_commands, env=env)
     result = await read_codex_rate_limits(command, env)
     return parse_codex_rate_limits(result)
-
-
-fetch_codex_quota.quota_source = SOURCE  # type: ignore[attr-defined]

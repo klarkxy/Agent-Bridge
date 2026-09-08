@@ -19,17 +19,19 @@ import json
 import logging
 import ssl
 import time
+import urllib.request
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit
-from urllib.request import proxy_bypass_environment  # type: ignore[attr-defined]  # Missing from Windows typeshed.
 
 import httpx2
 from pydantic import BaseModel, Field
 
 from agent_bridge.config import AgentConfig, AppConfig
 from agent_bridge.models import iso, utcnow
+from agent_bridge.quota_endpoints import quota_block_reason
 
 log = logging.getLogger(__name__)
 
@@ -81,7 +83,13 @@ class QuotaStatus(BaseModel):
     detail: str | None = None
 
 
-QuotaProvider = Callable[[AgentConfig, Mapping[str, str]], Awaitable[QuotaStatus]]
+QuotaFetch = Callable[[AgentConfig, Mapping[str, str]], Awaitable[QuotaStatus]]
+
+
+@dataclass(frozen=True)
+class QuotaProvider:
+    source: str | None
+    fetch: QuotaFetch
 
 
 def unknown_quota(detail: str, *, source: str | None = None) -> QuotaStatus:
@@ -229,7 +237,7 @@ class QuotaHTTPError(RuntimeError):
 def _proxy_map(env: Mapping[str, str]) -> dict[str, str]:
     proxies: dict[str, str] = {}
     for scheme in ("https", "http"):
-        for key in (f"{scheme.upper()}_PROXY", f"{scheme}_proxy"):
+        for key in (f"{scheme.upper()}_PROXY", f"{scheme}_proxy", "ALL_PROXY", "all_proxy"):
             value = (env.get(key) or "").strip()
             if value:
                 proxies[scheme] = value
@@ -256,7 +264,8 @@ async def get_json(
         capath=worker_env.get("SSL_CERT_DIR") or None,
     )
     proxies = _proxy_map(worker_env)
-    if proxy_bypass_environment(
+    proxy_bypass = cast(Callable[[str, Mapping[str, str]], bool], vars(urllib.request)["proxy_bypass_environment"])
+    if proxy_bypass(
         urlsplit(url).netloc, {"no": worker_env.get("NO_PROXY") or worker_env.get("no_proxy") or ""},
     ):
         proxies = {}
@@ -274,6 +283,15 @@ async def get_json(
             message = response.content.decode("utf-8", errors="replace").strip().replace("\n", " ")[:160]
             raise QuotaHTTPError(response.status_code, message) from None
         return json.loads(response.content.decode("utf-8"))
+
+
+def _seconds_until_reset(status: QuotaStatus) -> float | None:
+    now = utcnow()
+    return min(
+        ((reset - now).total_seconds() for window in status.windows
+         if (reset := parse_timestamp(window.resets_at)) is not None),
+        default=None,
+    )
 
 
 class QuotaCache:
@@ -310,25 +328,42 @@ class QuotaCache:
         if entry is None:
             return None
         expires_at, status = entry
-        if (now if now is not None else time.monotonic()) >= expires_at:
+        reset_in = _seconds_until_reset(status)
+        if (now if now is not None else time.monotonic()) >= expires_at or (reset_in is not None and reset_in <= 0):
             self._fresh.pop(name, None)
             return None
         return status
 
     def last_good(self, name: str) -> QuotaStatus | None:
-        return self._last_good.get(name)
+        status = self._last_good.get(name)
+        if status is not None:
+            reset_in = _seconds_until_reset(status)
+            if reset_in is not None and reset_in <= 0:
+                self._last_good.pop(name, None)
+                return None
+        return status
 
     def put(self, name: str, status: QuotaStatus, *, ttl_sec: float | None = None) -> None:
         ttl = self.ttl_sec if ttl_sec is None else max(float(ttl_sec), 0.0)
+        reset_in = _seconds_until_reset(status)
+        if reset_in is not None:
+            ttl = min(ttl, max(reset_in, 0.0))
         if ttl > 0:
             self._fresh[name] = (time.monotonic() + ttl, status)
-        if status.status in ("ok", "exhausted"):
+        else:
+            self._fresh.pop(name, None)
+        if status.status in ("ok", "exhausted") and not status.stale and (reset_in is None or reset_in > 0):
             self._last_good[name] = status
 
     def invalidate(self, name: str) -> None:
         self._fresh.pop(name, None)
         # Old callers may finish, but new callers must start a fresh reading.
         self._inflight.pop(name, None)
+
+    def forget(self, name: str) -> None:
+        """Configuration no longer identifies a supported account."""
+        self.invalidate(name)
+        self._last_good.pop(name, None)
 
     def clear(self) -> None:
         self._fresh.clear()
@@ -391,6 +426,9 @@ async def fetch_quota(
     providers: Mapping[str, QuotaProvider] | None = None,
 ) -> dict[str, Any]:
     """Return the ``quota`` dict for one worker. Never raises."""
+    if reason := quota_block_reason(cfg, env):
+        cache.forget(cfg.name)
+        return _dump(unknown_quota(reason))
     hit = cache.get(cfg.name)
     if hit is not None:
         return _dump(hit.model_copy(update={"cached": True}))
@@ -430,10 +468,10 @@ async def _fetch_quota(
     if provider is None:
         return unknown_quota(f"quota lookup is not supported for {cfg.name}")
 
-    source = getattr(provider, "quota_source", None)
+    source = provider.source
 
     async def invoke() -> QuotaStatus:
-        return await provider(cfg, env)
+        return await provider.fetch(cfg, env)
 
     read = asyncio.create_task(invoke())
     cache.track(read)
@@ -471,19 +509,23 @@ def default_providers(*, experimental: bool = False) -> dict[str, QuotaProvider]
     their own ``/usage`` commands call; those are behind ``[quota] experimental``
     because they can change without notice.
     """
+    from agent_bridge.quota_codex import SOURCE as CODEX_SOURCE
     from agent_bridge.quota_codex import fetch_codex_quota
+    from agent_bridge.quota_kimi import SOURCE as KIMI_SOURCE
     from agent_bridge.quota_kimi import fetch_kimi_quota
 
     table: dict[str, QuotaProvider] = {
-        "protocol:codex": fetch_codex_quota,
-        "kimi": fetch_kimi_quota,
+        "protocol:codex": QuotaProvider(CODEX_SOURCE, fetch_codex_quota),
+        "kimi": QuotaProvider(KIMI_SOURCE, fetch_kimi_quota),
     }
     if experimental:
+        from agent_bridge.quota_claude import SOURCE as CLAUDE_SOURCE
         from agent_bridge.quota_claude import fetch_claude_quota
+        from agent_bridge.quota_grok import SOURCE as GROK_SOURCE
         from agent_bridge.quota_grok import fetch_grok_quota
 
-        table["grok"] = fetch_grok_quota
-        table["claude"] = fetch_claude_quota
+        table["grok"] = QuotaProvider(GROK_SOURCE, fetch_grok_quota)
+        table["claude"] = QuotaProvider(CLAUDE_SOURCE, fetch_claude_quota)
     return table
 
 
@@ -501,7 +543,7 @@ def experimental_placeholders() -> dict[str, QuotaProvider]:
     async def claude_placeholder(cfg: AgentConfig, env: Mapping[str, str]) -> QuotaStatus:
         return unknown_quota(f"Claude Code plan usage {EXPERIMENTAL_HINT}")
 
-    return {"grok": grok_placeholder, "claude": claude_placeholder}
+    return {"grok": QuotaProvider(None, grok_placeholder), "claude": QuotaProvider(None, claude_placeholder)}
 
 
 def provider_table(config: AppConfig) -> dict[str, QuotaProvider]:

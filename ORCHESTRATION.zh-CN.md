@@ -35,7 +35,7 @@ Worker **只能**通过 Agent Bridge 的 MCP 工具调用（`list_agents`、`dis
 
 `list_agents` 显示该 Worker 不可用时，自己做。MCP 工具不在列表里不算「Worker 不可用」——那是上面的停机条件。
 
-`list_agents` 每一行还带 `quota`：`status` 为 ok / exhausted / unknown，`windows[]` 里是各个滚动窗口的 `remaining_percent` 和 `resets_at`（重置时间），按量付费的 Worker 给 `balance`。这是信息，不是路由规则：`exhausted` 表示这个 Worker 这一轮大概率会失败——换一个，或告诉用户什么时候重置；`unknown` 表示 Bridge 读不到（CLI 不支持、API key 登录、超时），不代表额度已用完。额度不影响 `available`。
+`list_agents` 每一行还带 `quota`：`status` 为 ok / exhausted / unknown，`windows[]` 里是各个滚动窗口的 `remaining_percent` 和 `resets_at`（重置时间），提供方支持时返回 `balance`。这是信息，不是路由规则：`exhausted` 表示这个 Worker 这一轮大概率会失败——换一个，或告诉用户什么时候重置；`unknown` 表示 Bridge 读不到（CLI 不支持、API key 登录、超时），不代表额度已用完。额度不影响 `available`。自定义 API／认证端点不支持额度查询，返回 `unknown`；缓存最迟在窗口重置时失效。DSH 不支持余额查询。
 
 示例：
 

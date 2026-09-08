@@ -11,7 +11,7 @@ import pytest
 from agent_bridge.adapters.fake import FakeAdapter
 from agent_bridge.cli import main
 from agent_bridge.models import TurnResult
-from agent_bridge.quota import QuotaStatus, QuotaWindow
+from agent_bridge.quota import QuotaProvider, QuotaStatus, QuotaWindow
 from agent_bridge.registry import Registry
 from agent_bridge.server import INSTRUCTIONS, list_agents
 
@@ -51,7 +51,7 @@ async def test_list_agents_uses_provider_and_cache(bridge_home, monkeypatch):
         assert isinstance(env, dict)
         return QuotaStatus(status="ok", windows=[QuotaWindow(name="5h", remaining_percent=42.0)])
 
-    monkeypatch.setattr("agent_bridge.registry.provider_table", lambda config: {"fake": provider})
+    monkeypatch.setattr("agent_bridge.registry.provider_table", lambda config: {"fake": QuotaProvider(None, provider)})
     first = (await registry.list_agents())[0]["quota"]
     second = (await registry.list_agents())[0]["quota"]
     assert calls == 1
@@ -70,7 +70,7 @@ async def test_list_agents_bounded_by_quota_timeout(bridge_home, monkeypatch):
         await asyncio.sleep(10)
         return QuotaStatus(status="ok")
 
-    monkeypatch.setattr("agent_bridge.registry.provider_table", lambda config: {"fake": hang})
+    monkeypatch.setattr("agent_bridge.registry.provider_table", lambda config: {"fake": QuotaProvider(None, hang)})
     started = time.monotonic()
     row = (await registry.list_agents())[0]
     assert time.monotonic() - started < 3
@@ -88,7 +88,7 @@ async def test_list_agents_quota_disabled(bridge_home, monkeypatch):
     async def never(cfg, env):
         raise AssertionError("provider must not run when quota is disabled")
 
-    monkeypatch.setattr("agent_bridge.registry.provider_table", lambda config: {"fake": never})
+    monkeypatch.setattr("agent_bridge.registry.provider_table", lambda config: {"fake": QuotaProvider(None, never)})
     row = (await registry.list_agents())[0]
     assert row["quota"]["status"] == "unknown"
     assert "disabled" in row["quota"]["detail"]
@@ -102,7 +102,7 @@ async def test_list_agents_survives_provider_raising(bridge_home, monkeypatch):
     async def boom(cfg, env):
         raise RuntimeError("HTTP 500: upstream")
 
-    monkeypatch.setattr("agent_bridge.registry.provider_table", lambda config: {"fake": boom})
+    monkeypatch.setattr("agent_bridge.registry.provider_table", lambda config: {"fake": QuotaProvider(None, boom)})
     row = (await registry.list_agents())[0]
     assert row["available"] is True
     assert row["quota"]["status"] == "unknown"
@@ -122,7 +122,7 @@ async def test_quota_error_on_a_turn_invalidates_the_cache(bridge_home, tmp_path
         calls += 1
         return QuotaStatus(status="ok", windows=[QuotaWindow(name="5h", remaining_percent=5.0)])
 
-    monkeypatch.setattr("agent_bridge.registry.provider_table", lambda config: {"fake": provider})
+    monkeypatch.setattr("agent_bridge.registry.provider_table", lambda config: {"fake": QuotaProvider(None, provider)})
 
     async def dry_turn(self, session, task):
         return TurnResult(text="", stop_reason="error", error="quota exceeded for this plan")
@@ -154,7 +154,7 @@ async def test_kimi_style_warning_on_completed_turn_invalidates_the_cache(bridge
         calls += 1
         return QuotaStatus(status="ok")
 
-    monkeypatch.setattr("agent_bridge.registry.provider_table", lambda config: {"fake": provider})
+    monkeypatch.setattr("agent_bridge.registry.provider_table", lambda config: {"fake": QuotaProvider(None, provider)})
 
     async def warned_turn(self, session, task):
         return TurnResult(text="", stop_reason="end_turn", warnings=["turn failed: provider.quota_exceeded"])
@@ -185,7 +185,7 @@ async def test_unrelated_failure_keeps_the_cache(bridge_home, tmp_path, monkeypa
         calls += 1
         return QuotaStatus(status="ok")
 
-    monkeypatch.setattr("agent_bridge.registry.provider_table", lambda config: {"fake": provider})
+    monkeypatch.setattr("agent_bridge.registry.provider_table", lambda config: {"fake": QuotaProvider(None, provider)})
 
     async def broken_turn(self, session, task):
         return TurnResult(text="", stop_reason="error", error="syntax error in tool call")

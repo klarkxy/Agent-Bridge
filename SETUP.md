@@ -355,18 +355,20 @@ Every `list_agents` row carries a `quota` block so the coordinator can weigh how
 ```
 
 - `status` is `ok`, `exhausted` (a window is fully used, or the account is blocked), or `unknown`. `unknown` means Bridge could not read the number — the reason is in `detail` — and never that the quota is empty. Quota does not change `available`, and Bridge does not route on it: the rulebook tells the coordinator to treat it as information next to your `[coordinator] instructions`.
-- `windows[]` are the CLI's rolling limits; `balance` is for pay-as-you-go workers; `cached` means the reading was reused from the last lookup, `stale` that a fresh lookup failed and the last good reading is shown instead.
+- `windows[]` are the CLI's rolling limits; `balance` is optional provider-reported credit; `cached` means the reading was reused from the last lookup, `stale` that a fresh lookup failed and the last good reading is shown instead.
 
 Where each number comes from:
 
 | Worker | Source | Needs |
 | --- | --- | --- |
 | Codex CLI | `codex app-server` → `account/rateLimits/read` (5h + weekly, plan, credits) | ChatGPT sign-in (`codex login`); API-key logins have no plan quota |
-| Kimi Code | `GET <Kimi Code base_url>/usages` — the same call the interactive `/usage` makes | `kimi login` (OAuth); Moonshot API-key sessions answer `unknown` |
+| Kimi Code | `GET https://api.kimi.com/coding/v1/usages` — the same call the interactive `/usage` makes | `kimi login` (OAuth); Moonshot API-key sessions answer `unknown` |
 | DeepSeek Harness | `unknown` — balance lookup is not supported | DSH can use different providers and accounts; a DeepSeek key does not identify the active account |
-| Grok Build | `GET cli-chat-proxy.grok.com/v1/billing` — what `/usage` calls; **experimental** | `grok login` session in `~/.grok/auth.json`; `[quota] experimental = true` |
+| Grok Build | `GET cli-chat-proxy.grok.com/v1/billing` — what `/usage` calls; **experimental** | Default first-party xAI OAuth scope in `~/.grok/auth.json` (or `GROK_AUTH_PATH`); `[quota] experimental = true` |
 | Claude Code | `GET api.anthropic.com/api/oauth/usage` — what `/usage` calls; **experimental** | `claude auth login` OAuth; `[quota] experimental = true` |
 | Antigravity, Cursor, OpenCode, Devin, others | — | always `unknown` with the reason in `detail` |
+
+Custom API or OAuth endpoints are unsupported for quota lookup. Bridge checks each supported CLI's environment, selected provider/configuration and supported startup selectors before using either credentials or cached quota. Unreadable or unverified configuration returns `unknown`; ordinary HTTP(S)/ALL_PROXY transport proxies are supported. Kimi reads only the default `kimi-code.json` slot. Grok verifies the exact default OAuth scope, issuer, expiry and user ID, and sends the CLI's version and authentication headers. DSH balance remains unsupported.
 
 Bridge reads credential files the CLIs already wrote; it never refreshes or rewrites them. Tune it in `[quota]` (repo `agents.toml` or `%USERPROFILE%\.agent-bridge\agents.toml`):
 
@@ -374,9 +376,11 @@ Bridge reads credential files the CLIs already wrote; it never refreshes or rewr
 [quota]
 enabled = true        # false: every row answers unknown, nothing is spawned
 timeout_sec = 4       # one worker's lookup is cut off after this
-cache_sec = 300       # a reading is reused for this long
+cache_sec = 300       # maximum lifetime, capped at the earliest window reset
 experimental = false  # also read Grok Build / Claude Code private endpoints
 ```
+
+At a window reset, the next lookup re-reads the provider. If that refresh fails, the expired reading is not reused, even as stale data; the result is `unknown`.
 
 A task that fails with a quota-looking error (`quota`, `rate limit`, `insufficient balance`, …) drops that worker's cached reading so the next `list_agents` re-reads it. `agent-bridge --quota` prints a fresh reading for every worker without the cache — use it when a row says `unknown` and you want to see why.
 

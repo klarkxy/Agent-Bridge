@@ -48,8 +48,8 @@ INSTRUCTIONS = (
     "coordinator.runtime_context, and coordinator.dispatch_enabled. User "
     "preferences in instructions override default worker routing. Each "
     "agents[] row carries quota: status ok/exhausted/unknown, rolling windows "
-    "with remaining_percent and resets_at, and a balance for pay-as-you-go "
-    "workers. unknown means Bridge could not read it, not that it is empty; "
+    "with remaining_percent and resets_at, and optional provider-reported balance for "
+    "workers. Custom API/auth endpoints are unsupported; cached readings expire at window reset. unknown means Bridge could not read it, not that it is empty; "
     "an exhausted worker will most likely fail its turn. Quota is information "
     "for you and the user, not a routing rule — instructions still decide. If "
     "dispatch_enabled is false, this Bridge was inherited inside a worker "
@@ -76,7 +76,7 @@ def _error(exc: Exception) -> dict[str, Any]:
 
 @mcp.tool(annotations=READ_ONLY)
 async def list_agents(ctx: Context) -> dict[str, Any]:
-    """List configured workers, the reconstructed host/proxy environment, and the coordinator policy (mode, instructions, runtime_context, dispatch_enabled). Call this first. Each agents[] row also carries quota: status ok | exhausted | unknown, windows[] with remaining_percent / resets_at / resets_in_sec, balance for pay-as-you-go workers, cached / stale flags, and detail. unknown means the quota could not be read (unsupported CLI, API-key login, timeout) — not that it is empty. Quota never affects available; treat it as information, routing still follows coordinator.instructions. If dispatch_enabled is false, this is a nested worker-inherited instance — do not dispatch or set_preferences."""
+    """List configured workers, the reconstructed host/proxy environment, and the coordinator policy (mode, instructions, runtime_context, dispatch_enabled). Call this first. Each agents[] row also carries quota: status ok | exhausted | unknown, windows[] with remaining_percent / resets_at / resets_in_sec, optional balance when reported by the provider, cached / stale flags, and detail. unknown means the quota could not be read (unsupported CLI, API-key login, timeout) — not that it is empty. Custom API/auth endpoints are unsupported; cached readings expire at window reset. Quota never affects available; treat it as information, routing still follows coordinator.instructions. If dispatch_enabled is false, this is a nested worker-inherited instance — do not dispatch or set_preferences."""
     try:
         registry = _registry(ctx)
         agents = await registry.list_agents()

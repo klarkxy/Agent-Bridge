@@ -14,6 +14,7 @@ from agent_bridge.quota import (
     FAILURE_CACHE_SEC,
     QuotaBalance,
     QuotaCache,
+    QuotaProvider,
     QuotaStatus,
     QuotaWindow,
     _proxy_map,
@@ -31,8 +32,16 @@ from agent_bridge.quota import (
 )
 from agent_bridge.quota_claude import claude_access_token, fetch_claude_quota, parse_claude_usage
 from agent_bridge.quota_codex import fetch_codex_quota, parse_codex_rate_limits
-from agent_bridge.quota_grok import fetch_grok_quota, grok_auth_token, parse_grok_billing
+from agent_bridge.quota_grok import fetch_grok_quota, grok_auth_headers, parse_grok_billing
 from agent_bridge.quota_kimi import fetch_kimi_quota, kimi_access_token, kimi_usage_url, parse_kimi_usage
+
+
+@pytest.fixture(autouse=True)
+def isolated_quota_homes(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    for key in ("KIMI_CODE_HOME", "GROK_HOME"):
+        monkeypatch.delenv(key, raising=False)
+
 
 FAKE_CODEX = Path(__file__).with_name("fake_codex.py")
 FAR_FUTURE = 4102444800  # 2100-01-01T00:00:00Z
@@ -125,6 +134,10 @@ def test_proxy_map_prefers_upper_case_and_skips_blank():
     env = {"HTTPS_PROXY": "http://p:1", "https_proxy": "http://ignored", "http_proxy": " ", "HTTP_PROXY": ""}
     assert _proxy_map(env) == {"https": "http://p:1"}
     assert _proxy_map({}) == {}
+    assert _proxy_map({"ALL_PROXY": "http://all:1", "https_proxy": "http://https:2"}) == {
+        "http": "http://all:1", "https": "http://https:2",
+    }
+    assert _proxy_map({"all_proxy": "http://all:1"}) == {"http": "http://all:1", "https": "http://all:1"}
 
 
 # --- cache ---------------------------------------------------------------------
@@ -180,8 +193,8 @@ async def test_fetch_quota_serves_cache_and_marks_it():
 
     cache = QuotaCache(60)
     cfg = _agent("kimi", "acp")
-    first = await fetch_quota(cfg, {}, cache=cache, timeout_sec=1, providers={"kimi": provider})
-    second = await fetch_quota(cfg, {}, cache=cache, timeout_sec=1, providers={"kimi": provider})
+    first = await fetch_quota(cfg, {}, cache=cache, timeout_sec=1, providers={"kimi": QuotaProvider(None, provider)})
+    second = await fetch_quota(cfg, {}, cache=cache, timeout_sec=1, providers={"kimi": QuotaProvider(None, provider)})
     assert calls == 1
     assert first["cached"] is False and second["cached"] is True
     assert second["windows"][0]["remaining_percent"] == 70
@@ -196,7 +209,7 @@ async def test_fetch_quota_timeout_is_unknown_and_bounded():
 
     cache = QuotaCache(600)
     started = time.monotonic()
-    row = await fetch_quota(_agent("grok", "acp"), {}, cache=cache, timeout_sec=0.2, providers={"grok": slow})
+    row = await fetch_quota(_agent("grok", "acp"), {}, cache=cache, timeout_sec=0.2, providers={"grok": QuotaProvider(None, slow)})
     assert time.monotonic() - started < 2
     assert row["status"] == "unknown"
     assert "timed out after 0.2s" in row["detail"]
@@ -214,14 +227,13 @@ async def test_fetch_quota_provider_exception_falls_back_to_last_good():
             raise RuntimeError("HTTP 429: Rate limited.")
         return QuotaStatus(status="ok", windows=[QuotaWindow(name="weekly", remaining_percent=61)])
 
-    flaky.quota_source = "test source"
     cache = QuotaCache(600)
     cfg = _agent("claude", "acp")
-    good = await fetch_quota(cfg, {}, cache=cache, timeout_sec=1, providers={"claude": flaky})
+    good = await fetch_quota(cfg, {}, cache=cache, timeout_sec=1, providers={"claude": QuotaProvider("test source", flaky)})
     assert good["status"] == "ok" and good["source"] == "test source"
     cache.invalidate("claude")
     state["fail"] = True
-    stale = await fetch_quota(cfg, {}, cache=cache, timeout_sec=1, providers={"claude": flaky})
+    stale = await fetch_quota(cfg, {}, cache=cache, timeout_sec=1, providers={"claude": QuotaProvider("test source", flaky)})
     assert stale["status"] == "ok"
     assert stale["stale"] is True and stale["cached"] is True
     assert "RuntimeError: HTTP 429" in stale["detail"]
@@ -233,7 +245,7 @@ async def test_fetch_quota_provider_exception_without_history_is_unknown():
     async def broken(cfg, env):
         raise ValueError("bad payload")
 
-    row = await fetch_quota(_agent("dsh", "acp"), {}, cache=QuotaCache(60), timeout_sec=1, providers={"dsh": broken})
+    row = await fetch_quota(_agent("dsh", "acp"), {}, cache=QuotaCache(60), timeout_sec=1, providers={"dsh": QuotaProvider(None, broken)})
     assert row["status"] == "unknown"
     assert "ValueError: bad payload" in row["detail"]
 
@@ -243,8 +255,7 @@ async def test_fetch_quota_normalises_bogus_status_and_fills_source():
     async def odd(cfg, env):
         return QuotaStatus(status="green", windows=[QuotaWindow(name="5h", remaining_percent=1)])
 
-    odd.quota_source = "odd source"
-    row = await fetch_quota(_agent("kimi", "acp"), {}, cache=QuotaCache(60), timeout_sec=1, providers={"kimi": odd})
+    row = await fetch_quota(_agent("kimi", "acp"), {}, cache=QuotaCache(60), timeout_sec=1, providers={"kimi": QuotaProvider("odd source", odd)})
     assert row["status"] == "unknown"
     assert row["source"] == "odd source"
 
@@ -264,14 +275,14 @@ def test_provider_table_gates_experimental_workers():
     config = AppConfig(quota=QuotaConfig(experimental=False))
     table = provider_table(config)
     assert table["grok"] is not full["grok"]
-    assert provider_table(AppConfig(quota=QuotaConfig(experimental=True)))["grok"] is full["grok"]
+    assert provider_table(AppConfig(quota=QuotaConfig(experimental=True)))["grok"] == full["grok"]
 
 
 @pytest.mark.asyncio
 async def test_experimental_placeholders_explain_the_flag():
     table = provider_table(AppConfig(quota=QuotaConfig(experimental=False)))
-    grok = await table["grok"](_agent("grok", "acp"), {})
-    claude = await table["claude"](_agent("claude", "acp"), {})
+    grok = await table["grok"].fetch(_agent("grok", "acp"), {})
+    claude = await table["claude"].fetch(_agent("claude", "acp"), {})
     for status in (grok, claude):
         assert status.status == "unknown"
         assert "experimental = true" in (status.detail or "")
@@ -355,7 +366,7 @@ async def test_codex_provider_hang_becomes_unknown_through_fetch_quota(monkeypat
         env,
         cache=QuotaCache(60),
         timeout_sec=0.5,
-        providers={"protocol:codex": fetch_codex_quota},
+        providers={"protocol:codex": QuotaProvider(None, fetch_codex_quota)},
     )
     assert time.monotonic() - started < 4
     assert row["status"] == "unknown"
@@ -367,7 +378,8 @@ async def test_codex_provider_hang_becomes_unknown_through_fetch_quota(monkeypat
 
 def test_kimi_usage_url_honours_base_url_override():
     assert kimi_usage_url({}) == "https://api.kimi.com/coding/v1/usages"
-    assert kimi_usage_url({"KIMI_CODE_BASE_URL": "https://proxy.example/v1/"}) == "https://proxy.example/v1/usages"
+    with pytest.raises(ValueError, match="custom endpoints"):
+        kimi_usage_url({"KIMI_CODE_BASE_URL": "https://proxy.example/v1/"})
 
 
 def test_kimi_access_token_reads_credential_file(tmp_path: Path):
@@ -465,24 +477,26 @@ async def test_dsh_quota_is_unknown_even_with_deepseek_key(monkeypatch, experime
 # --- grok ----------------------------------------------------------------------
 
 
-def test_grok_auth_token_prefers_oidc_scope_and_checks_expiry(tmp_path: Path):
-    token, problem = grok_auth_token(tmp_path)
-    assert token is None and "grok login" in problem
-    (tmp_path / "auth.json").write_text(
-        json.dumps(
-            {
-                "https://accounts.x.ai/sign-in": {"key": "legacy"},
-                "https://auth.x.ai::client": {"key": "oidc", "expires_at": FAR_FUTURE},
-            }
-        ),
-        encoding="utf-8",
-    )
-    assert grok_auth_token(tmp_path) == ("oidc", None)
-    (tmp_path / "auth.json").write_text(
-        json.dumps({"https://auth.x.ai::client": {"key": "oidc", "expires_at": 1000}}), encoding="utf-8"
-    )
-    token, problem = grok_auth_token(tmp_path, now=2000.0)
-    assert token is None and "expired" in problem
+def test_grok_auth_headers_select_exact_scope_and_check_expiry(tmp_path: Path):
+    from agent_bridge.quota_endpoints import GROK_AUTH_SCOPE
+
+    headers, problem = grok_auth_headers(tmp_path, version="1.0.13")
+    assert headers is None and "grok login" in problem
+    entry = {"key": "official", "auth_mode": "oidc", "oidc_issuer": "https://auth.x.ai",
+             "user_id": "test-user", "expires_at": "2100-01-01T00:00:00Z"}
+    (tmp_path / "auth.json").write_text(json.dumps({
+        "https://enterprise.example::client": {"key": "enterprise"}, GROK_AUTH_SCOPE: entry,
+    }), encoding="utf-8")
+    headers, problem = grok_auth_headers(tmp_path, version="1.0.13")
+    assert problem is None
+    assert headers == {
+        "Authorization": "Bearer official", "X-XAI-Token-Auth": "xai-grok-cli", "x-userid": "test-user",
+        "x-grok-client-version": "1.0.13", "x-grok-client-mode": "headless",
+    }
+    entry["expires_at"] = "1970-01-01T00:00:01Z"
+    (tmp_path / "auth.json").write_text(json.dumps({GROK_AUTH_SCOPE: entry}), encoding="utf-8")
+    headers, problem = grok_auth_headers(tmp_path, version="1.0.13", now=2000.0)
+    assert headers is None and "expired" in problem
 
 
 def test_parse_grok_billing_weekly_window_and_products():
@@ -634,13 +648,51 @@ async def test_cached_countdown_advances_without_mutating_reading(monkeypatch, s
         raise RuntimeError("offline")
 
     monkeypatch.setattr("agent_bridge.quota.utcnow", lambda: now + timedelta(seconds=20))
-    row = await fetch_quota(_agent(), {}, cache=cache, timeout_sec=1, providers={"fake": broken})
+    row = await fetch_quota(_agent(), {}, cache=cache, timeout_sec=1, providers={"fake": QuotaProvider(None, broken)})
     assert row["windows"][0]["resets_in_sec"] == 40
     assert row["stale"] is stale
     monkeypatch.setattr("agent_bridge.quota.utcnow", lambda: now + timedelta(seconds=70))
-    row = await fetch_quota(_agent(), {}, cache=cache, timeout_sec=1, providers={"fake": broken})
-    assert row["windows"][0]["resets_in_sec"] == 0
+    row = await fetch_quota(_agent(), {}, cache=cache, timeout_sec=1, providers={"fake": QuotaProvider(None, broken)})
+    assert row["status"] == "unknown"
+    assert row["windows"] == []
     assert original.windows[0].resets_in_sec == 60
+
+
+@pytest.mark.parametrize("failure", [False, True])
+async def test_cached_quota_refetches_after_window_reset(monkeypatch, failure):
+    now = datetime(2099, 1, 1, tzinfo=UTC)
+    monkeypatch.setattr("agent_bridge.quota.utcnow", lambda: now)
+    cache = QuotaCache(300)
+    calls = 0
+
+    async def provider(cfg, env):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return summarize_quota([
+                window_from_reset("weekly", 70, (now + timedelta(days=1)).isoformat()),
+                window_from_reset("5h", 0, (now + timedelta(seconds=1)).isoformat()),
+            ])
+        if failure:
+            raise RuntimeError("refresh failed")
+        return summarize_quota([window_from_reset("5h", 100, (now + timedelta(hours=5)).isoformat())])
+
+    table = {"fake": QuotaProvider("test", provider)}
+    try:
+        assert (await fetch_quota(_agent(), {}, cache=cache, timeout_sec=1, providers=table))["status"] == "exhausted"
+        assert (await fetch_quota(_agent(), {}, cache=cache, timeout_sec=1, providers=table))["cached"]
+        assert calls == 1
+        now += timedelta(seconds=1.2)
+        row = await fetch_quota(_agent(), {}, cache=cache, timeout_sec=1, providers=table)
+        assert calls == 2
+        assert row["status"] == ("unknown" if failure else "ok")
+        assert not row["stale"]
+        assert not row["cached"]
+        if failure:
+            assert row["windows"] == []
+            assert cache.last_good("fake") is None
+    finally:
+        await cache.close()
 
 
 @pytest.mark.asyncio
@@ -661,7 +713,7 @@ async def test_concurrent_fetches_share_read_and_isolate_cancellation(failure):
     cache = QuotaCache(300)
 
     async def fetch():
-        return await fetch_quota(_agent(), {}, cache=cache, timeout_sec=1, providers={"fake": provider})
+        return await fetch_quota(_agent(), {}, cache=cache, timeout_sec=1, providers={"fake": QuotaProvider(None, provider)})
 
     first = asyncio.create_task(fetch())
     await started.wait()
@@ -697,7 +749,7 @@ async def test_invalidation_during_read_cannot_restore_old_cache(clear):
     cache = QuotaCache(300)
 
     async def fetch():
-        return await fetch_quota(_agent(), {}, cache=cache, timeout_sec=1, providers={"fake": provider})
+        return await fetch_quota(_agent(), {}, cache=cache, timeout_sec=1, providers={"fake": QuotaProvider(None, provider)})
 
     old = asyncio.create_task(fetch())
     await started.wait()
@@ -743,7 +795,7 @@ async def test_cli_command_check_uses_global_codex_environment(monkeypatch):
         return QuotaStatus(status="ok")
 
     monkeypatch.setattr("agent_bridge.probes.resolve_codex_command", resolve)
-    monkeypatch.setattr("agent_bridge.quota.provider_table", lambda config: {"protocol:codex": provider})
+    monkeypatch.setattr("agent_bridge.quota.provider_table", lambda config: {"protocol:codex": QuotaProvider(None, provider)})
     config = AppConfig(
         agents={"codex-alt": _agent("codex-alt", "codex")},
         env=EnvConfig(discover_proxy=False, inherit=[], set={"CODEX_CLI_PATH": "configured-codex"}),
@@ -799,7 +851,7 @@ async def test_codex_timeout_returns_before_resistant_child_cleanup(monkeypatch,
             dict(os.environ),
             cache=cache,
             timeout_sec=0.1,
-            providers={"protocol:codex": fetch_codex_quota},
+            providers={"protocol:codex": QuotaProvider(None, fetch_codex_quota)},
         )
         assert time.monotonic() - start < 0.6
         assert row["status"] == "unknown" and "timed out" in row["detail"]

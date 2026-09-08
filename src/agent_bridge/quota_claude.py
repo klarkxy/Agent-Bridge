@@ -30,6 +30,7 @@ from agent_bridge.quota import (
     unknown_quota,
     window_from_reset,
 )
+from agent_bridge.quota_endpoints import quota_block_reason
 
 SOURCE = "claude GET /api/oauth/usage (experimental)"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -86,6 +87,8 @@ def parse_claude_usage(payload: Mapping[str, Any] | None) -> QuotaStatus:
 
 
 async def fetch_claude_quota(cfg: AgentConfig, env: Mapping[str, str]) -> QuotaStatus:
+    if reason := quota_block_reason(cfg, env):
+        return unknown_quota(reason, source=SOURCE)
     auth = describe_claude_auth(env)
     if not auth.startswith("oauth"):
         return unknown_quota(
@@ -107,6 +110,3 @@ async def fetch_claude_quota(cfg: AgentConfig, env: Mapping[str, str]) -> QuotaS
         timeout=10.0,
     )
     return parse_claude_usage(payload)
-
-
-fetch_claude_quota.quota_source = SOURCE  # type: ignore[attr-defined]

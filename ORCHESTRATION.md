@@ -26,7 +26,7 @@ Dispatch when: the change spans several files or needs unexplored work; tests or
 
 If every worker is `available: false`, do the work yourself. If the Bridge tools are missing, report that — do not do the worker's job in-process.
 
-Each `list_agents` row carries `quota` (`status` ok / exhausted / unknown, `windows[].remaining_percent` + `resets_at`, `balance`). It is information, not a routing rule: `exhausted` means that worker will most likely fail its turn — prefer another or tell the user when it resets; `unknown` means Bridge could not read it (unsupported CLI, API-key login, timeout), not that it is empty.
+Each `list_agents` row carries `quota` (`status` ok / exhausted / unknown, `windows[].remaining_percent` + `resets_at`, `balance`). It is information, not a routing rule: `exhausted` means that worker will most likely fail its turn — prefer another or tell the user when it resets; `unknown` means Bridge could not read it (unsupported CLI, API-key login, timeout), not that it is empty. Custom API/auth endpoints return `unknown`; cache expires at window reset. DSH balance is unsupported.
 
 ## Step 2 — which worker
 

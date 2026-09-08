@@ -32,6 +32,7 @@ from agent_bridge.quota import (
     window_from_reset,
     window_name_from_minutes,
 )
+from agent_bridge.quota_endpoints import official_url, quota_block_reason
 
 SOURCE = "kimi code GET /usages"
 DEFAULT_BASE_URL = "https://api.kimi.com/coding/v1"
@@ -40,7 +41,9 @@ CREDENTIAL_FILE = "kimi-code.json"
 
 def kimi_usage_url(env: Mapping[str, str]) -> str:
     base = (env.get("KIMI_CODE_BASE_URL") or "").strip() or DEFAULT_BASE_URL
-    return f"{base.rstrip('/')}/usages"
+    if not official_url(base, DEFAULT_BASE_URL):
+        raise ValueError("quota lookup is not supported for custom endpoints")
+    return f"{DEFAULT_BASE_URL}/usages"
 
 
 def kimi_access_token(home: Path, *, now: float | None = None) -> tuple[str | None, str | None]:
@@ -48,13 +51,7 @@ def kimi_access_token(home: Path, *, now: float | None = None) -> tuple[str | No
     creds = home / "credentials"
     path = creds / CREDENTIAL_FILE
     if not path.is_file():
-        try:
-            candidates = sorted(creds.glob("*.json"))
-        except OSError:
-            candidates = []
-        if not candidates:
-            return None, "Kimi Code quota needs `kimi login` (OAuth); no credential file found"
-        path = candidates[0]
+        return None, "Kimi Code quota needs `kimi login` (OAuth); no credential file found"
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -140,6 +137,8 @@ def parse_kimi_usage(payload: Mapping[str, Any] | None) -> QuotaStatus:
 
 
 async def fetch_kimi_quota(cfg: AgentConfig, env: Mapping[str, str]) -> QuotaStatus:
+    if reason := quota_block_reason(cfg, env):
+        return unknown_quota(reason, source=SOURCE)
     raw_home = (env.get("KIMI_CODE_HOME") or "").strip()
     home = kimi_home(Path(raw_home) if raw_home else None)
     token, problem = kimi_access_token(home)
@@ -157,6 +156,3 @@ async def fetch_kimi_quota(cfg: AgentConfig, env: Mapping[str, str]) -> QuotaSta
         timeout=10.0,
     )
     return parse_kimi_usage(payload)
-
-
-fetch_kimi_quota.quota_source = SOURCE  # type: ignore[attr-defined]

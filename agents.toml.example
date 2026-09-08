@@ -29,6 +29,8 @@
 # Remaining quota returned with each list_agents row (agents[].quota).
 # Bridge only reports it; routing stays with the coordinator and your
 # instructions. Workers Bridge cannot query answer status = "unknown".
+# Custom API/auth endpoints are unsupported; cache expires at window reset.
+# DSH balance lookup is unsupported.
 # experimental = true also reads the private endpoints Grok Build's and
 # Claude Code's own /usage commands call (OAuth login only).
 # [quota]

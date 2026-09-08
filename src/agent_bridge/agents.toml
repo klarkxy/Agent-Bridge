@@ -21,18 +21,42 @@ inherit = [
   "KIMI_API_KEY",
   "KIMI_BASE_URL",
   "KIMI_CODE_BASE_URL",
+  "KIMI_CODE_OAUTH_HOST",
+  "KIMI_OAUTH_HOST",
+  "KIMI_MODEL_BASE_URL",
+  "KIMI_MODEL_NAME",
+  "KIMI_MODEL_API_KEY",
+  "KIMI_MODEL_PROVIDER_TYPE",
   "MOONSHOT_API_KEY",
   "DEEPSEEK_API_KEY",
   "OPENCODE_API_KEY",
   "XAI_API_KEY",
   "GROK_API_KEY",
+  "GROK_HOME",
+  "GROK_AUTH_PATH",
+  "GROK_CLI_CHAT_PROXY_BASE_URL",
+  "GROK_XAI_API_BASE_URL",
+  "GROK_MODELS_BASE_URL",
+  "GROK_MODELS_LIST_URL",
+  "GROK_OIDC_ISSUER",
+  "GROK_OIDC_CLIENT_ID",
+  "GROK_OAUTH2_ISSUER",
+  "GROK_OAUTH2_CLIENT_ID",
+  "GROK_LOCAL_AUTH",
+  "GROK_AUTH_PROVIDER_COMMAND",
+  "GROK_MANAGED_CONFIG_URL",
+  "GROK_CODE_XAI_API_KEY",
   "OPENAI_API_KEY",
+  "OPENAI_BASE_URL",
   "CODEX_API_KEY",
   "CODEX_CLI_PATH",
   "CODEX_HOME",
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
   "ANTHROPIC_BASE_URL",
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  "CLAUDE_CODE_USE_FOUNDRY",
   "ANTHROPIC_DEFAULT_SONNET_MODEL",
   "ANTHROPIC_DEFAULT_OPUS_MODEL",
   "ANTHROPIC_DEFAULT_HAIKU_MODEL",
@@ -94,7 +118,8 @@ enabled = true
 # One worker's lookup is cut off after this many seconds; list_agents never
 # waits longer than the slowest probe plus this.
 timeout_sec = 4
-# A reading is reused for this long before the CLI is asked again.
+# Maximum cache lifetime; each reading expires at its earliest window reset.
+# Custom API/auth endpoints return unknown without reading official credentials.
 cache_sec = 300
 # Grok Build and Claude Code only expose plan usage through the private
 # endpoints their own /usage commands call. Opt in; they may change.
