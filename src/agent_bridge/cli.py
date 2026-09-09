@@ -36,6 +36,7 @@ HELP = f"""Agent Bridge — connect local coding agents.
 Usage:
   agent-bridge                 start the MCP server on stdio
   agent-bridge --env           print reconstructed worker environment
+  agent-bridge --quota         print each worker's remaining quota (fresh, no cache)
   agent-bridge --version       print the installed version
   agent-bridge upgrade         one-command update (close coordinators first)
   agent-bridge install-skill   copy the coordinator skill into host skill dirs
@@ -228,6 +229,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         from agent_bridge.worker_env import describe_env
 
         print(json.dumps(describe_env(load_config().env), indent=2, ensure_ascii=False))
+        return
+    if command in {"--quota", "quota"}:
+        import asyncio
+
+        from agent_bridge.config import load_config
+        from agent_bridge.quota import describe_quotas
+
+        print(json.dumps(asyncio.run(describe_quotas(load_config())), indent=2, ensure_ascii=False))
         return
     if command in {"install-skill", "--install-skill"}:
         written = install_skill()

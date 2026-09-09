@@ -35,6 +35,10 @@ Worker **只能**通过 Agent Bridge 的 MCP 工具调用（`list_agents`、`dis
 
 `list_agents` 显示该 Worker 不可用时，自己做。MCP 工具不在列表里不算「Worker 不可用」——那是上面的停机条件。
 
+`list_agents` 每一行还带 `quota`：`status` 为 ok / exhausted / unknown，`windows[]` 里是各个滚动窗口的 `remaining_percent` 和 `resets_at`（重置时间），提供方支持时返回 `balance`。这是信息，不是路由规则：`exhausted` 表示这个 Worker 这一轮大概率会失败——换一个，或告诉用户什么时候重置；`unknown` 表示 Bridge 读不到（CLI 不支持、API key 登录、超时），不代表额度已用完。额度不影响 `available`。自定义 API／认证端点不支持额度查询，返回 `unknown`；缓存最迟在窗口重置时失效。DSH 不支持余额查询。
+
+Claude 的 `quota.status` 只汇总通用的 `5h` / `weekly` 额度。派发前，即使整体状态为 `ok`，也要检查指定模型对应的 `weekly:opus` 或 `weekly:sonnet` 窗口。`remaining_percent` 为 0 表示该模型额度已耗尽；告知用户重置时间，或采用用户路由指令允许的替代方案。读数缺失或为 null 表示未知。仅有模型专属窗口时，无法确定通用额度状态。
+
 示例：
 
 - 「修 README 里的错别字」→ 自己做。一行改动，写派发消息比改还贵。

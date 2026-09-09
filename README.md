@@ -101,7 +101,7 @@ Close coordinators that are holding Bridge, then `agent-bridge upgrade`, then re
 
 | Tool | Role |
 | --- | --- |
-| `list_agents` | Probe workers, report proxy/env + coordinator policy |
+| `list_agents` | Probe workers, report remaining quota, proxy/env + coordinator policy |
 | `set_preferences` | Persist coordinator mode / routing preferences |
 | `dispatch_task` | Start or resume a turn in the project `cwd` |
 | `wait_task` | Block up to `timeout_sec` (default 180) |
@@ -122,6 +122,23 @@ turn ends; a normal stop flushes everything, so only a crash or a hard kill can
 lose that last window. A turn whose worker stays silent past `stall_timeout_sec`
 (default 1800 s, per worker) ends `failed` / `stalled`; `check_task` shows
 `silent_for_sec`.
+
+### Remaining quota
+
+Each `list_agents` row carries `quota`: `status` ok / exhausted / unknown, the
+CLI's rolling windows with `remaining_percent` and `resets_at`, and an optional
+`balance` when supported. Codex (app-server) and Kimi Code (`kimi login`)
+are read out of the box; Grok Build and Claude
+Code sit behind `[quota] experimental = true`; everything else answers
+`unknown` with the reason. DSH balance lookup is not supported because its
+active provider and account can vary. Bridge reports, it does not route — the coordinator
+weighs it against your instructions. Lookups are bounded by `[quota]
+timeout_sec` and cached up to `cache_sec` or the earliest window reset. Custom API/auth endpoints return `unknown` before credentials or cached quota are used; `agent-bridge --quota` prints a fresh
+reading. Details: [SETUP.md](SETUP.md#remaining-quota-in-list_agents).
+
+Claude's overall status covers its shared limits. Model-specific weekly limits
+remain in `windows`; check the requested model's window before dispatch, even
+when the overall status is `ok`.
 
 ### Coordinator mode
 
@@ -235,7 +252,7 @@ revivable = true
 
 | 工具 | 作用 |
 | --- | --- |
-| `list_agents` | 探测 worker，报告代理 / 环境 + 协调者策略 |
+| `list_agents` | 探测 worker，报告剩余额度、代理 / 环境 + 协调者策略 |
 | `set_preferences` | 持久化协调者模式 / 路由偏好 |
 | `dispatch_task` | 在项目 `cwd` 里开始或续上一次回合 |
 | `wait_task` | 最多等待 `timeout_sec`（默认 180） |
@@ -253,6 +270,20 @@ revivable = true
 缓冲事件在累计 64 KB、间隔 30 秒或一轮结束时落盘；正常停止会全部刷出，只有崩溃或被强杀才可能丢掉最后这一窗口。
 Worker 静默超过 `stall_timeout_sec`（默认 1800 秒，可按 Worker 设置）的一轮会以
 `failed` / `stalled` 结束；`check_task` 会给出 `silent_for_sec`。
+
+### 剩余额度
+
+`list_agents` 每一行都带 `quota`：`status` 为 ok / exhausted / unknown，各个滚动窗口的
+`remaining_percent` 和 `resets_at`（重置时间），支持时还可提供 `balance`。
+Codex（app-server）、Kimi Code（`kimi login`）
+开箱即读；Grok Build 和 Claude Code 需要 `[quota] experimental = true`；其余 Worker
+返回 `unknown` 并附原因。DSH 的供应商和账户可以变化，暂不支持余额查询。Bridge 只报告、不路由——协调者结合你的 instructions 自己权衡。
+自定义 API／认证端点不支持额度查询，直接返回 `unknown`，不会读取官方凭据或旧额度缓存。
+每次查询受 `[quota] timeout_sec` 限制，缓存最迟在 `cache_sec` 秒或最近窗口重置时失效；`agent-bridge --quota`
+可以打印一份不走缓存的读数。细节见 [SETUP.md](SETUP.md#remaining-quota-in-list_agents)。
+
+Claude 的整体状态只汇总通用额度；模型专属周额度保留在 `windows` 中。
+即使整体为 `ok`，派发前仍需检查指定模型的窗口。
 
 ### 协调者档位
 

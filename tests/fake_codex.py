@@ -5,12 +5,54 @@ import os
 import sys
 import time
 
+DEFAULT_RATE_LIMITS = {
+    "rateLimits": {
+        "primary": {"usedPercent": 10, "windowDurationMins": 300, "resetsAt": 4102444800},
+        "secondary": {"usedPercent": 2, "windowDurationMins": 10080, "resetsAt": 4102444800},
+        "credits": {"hasCredits": False, "unlimited": False, "balance": "0"},
+        "planType": "plus",
+        "rateLimitReachedType": None,
+    }
+}
+
+
+def _app_server() -> int:
+    """Minimal JSON-RPC stdio stand-in for `codex app-server`."""
+    if os.environ.get("FAKE_CODEX_APP_SERVER_HANG"):
+        time.sleep(float(os.environ["FAKE_CODEX_APP_SERVER_HANG"]))
+        return 0
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        message = json.loads(line)
+        method = message.get("method")
+        request_id = message.get("id")
+        if request_id is None:
+            continue
+        if method == "initialize":
+            print(json.dumps({"id": request_id, "result": {"userAgent": "fake-codex"}}), flush=True)
+            continue
+        if method == "account/rateLimits/read":
+            if os.environ.get("FAKE_CODEX_APP_SERVER_ERROR"):
+                error = {"code": -32000, "message": os.environ["FAKE_CODEX_APP_SERVER_ERROR"]}
+                print(json.dumps({"id": request_id, "error": error}), flush=True)
+                return 0
+            raw = os.environ.get("FAKE_CODEX_RATE_LIMITS")
+            result = json.loads(raw) if raw else DEFAULT_RATE_LIMITS
+            print(json.dumps({"id": request_id, "result": result}), flush=True)
+            return 0
+        print(json.dumps({"id": request_id, "error": {"code": -32601, "message": "unknown method"}}), flush=True)
+    return 0
+
 
 def main(argv: list[str]) -> int:
     args = argv[1:]
     if "--version" in args:
         print("codex-cli 0.150.0-test")
         return 0
+    if args[:1] == ["app-server"]:
+        return _app_server()
     if "exec" in args and "--help" in args:
         print("Usage: codex exec [OPTIONS] [PROMPT]")
         print("  --json")

@@ -227,7 +227,7 @@ async def probe_agent(cfg: AgentConfig, env_config: EnvConfig | None = None) -> 
     }
 
 
-def command_exists(cfg: AgentConfig) -> bool:
+def command_exists(cfg: AgentConfig, *, env: dict[str, str] | None = None) -> bool:
     if cfg.protocol == "fake":
         return True
     try:
@@ -237,7 +237,7 @@ def command_exists(cfg: AgentConfig) -> bool:
             resolve_codex_command(
                 cfg.command,
                 cfg.fallback_commands,
-                env=build_worker_env(cfg.env, log_fill=False),
+                env=env if env is not None else build_worker_env(cfg.env, log_fill=False),
             )
         else:
             resolve_command(cfg.command, cfg.fallback_commands)
