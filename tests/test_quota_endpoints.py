@@ -179,6 +179,39 @@ def test_kimi_never_guesses_another_credential_file(tmp_path):
     assert token is None and "no credential file" in reason
 
 
+@pytest.mark.parametrize("credential", ['api_key="distributed-key"', '[providers.p.env]\nKIMI_API_KEY="distributed-key"'])
+async def test_kimi_managed_api_key_provider_cannot_use_oauth_quota(tmp_path, monkeypatch, credential):
+    home = tmp_path / ".kimi-code"
+    home.mkdir()
+    (home / "config.toml").write_text(
+        'default_model="custom"\n[models.custom]\nprovider="p"\n[providers.p]\n'
+        'type="kimi"\nbase_url="https://api.kimi.com/coding/v1"\n' + credential,
+        encoding="utf-8",
+    )
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("API-key providers must not read OAuth credentials or issue quota HTTP")
+
+    monkeypatch.setattr("agent_bridge.quota_kimi.kimi_access_token", forbidden)
+    monkeypatch.setattr("agent_bridge.quota_kimi.get_json", forbidden)
+    reason = quota_block_reason(cfg("kimi"), {})
+    assert reason is not None and "API-key" in reason
+    status = await fetch_kimi_quota(cfg("kimi"), {})
+    assert status.status == "unknown" and "API-key" in (status.detail or "")
+
+
+def test_kimi_default_oauth_provider_remains_supported(tmp_path):
+    home = tmp_path / ".kimi-code"
+    home.mkdir()
+    (home / "config.toml").write_text(
+        'default_model="kimi-code/k3"\n[models."kimi-code/k3"]\nprovider="managed:kimi-code"\n'
+        '[providers."managed:kimi-code"]\ntype="kimi"\nbase_url="https://api.kimi.com/coding/v1"\n'
+        'api_key=""\n[providers."managed:kimi-code".oauth]\nstorage="file"\nkey="kimi-code"',
+        encoding="utf-8",
+    )
+    assert quota_block_reason(cfg("kimi"), {}) is None
+
+
 @pytest.mark.parametrize("change", [
     {"oidc_issuer": "https://enterprise.invalid"}, {"oidc_issuer": "https://auth.x.ai.attacker.invalid"},
     {"auth_mode": "api_key"}, {"user_id": ""}, {"expires_at": None}, {"expires_at": "expired"},
