@@ -28,6 +28,8 @@ If every worker is `available: false`, do the work yourself. If the Bridge tools
 
 Each `list_agents` row carries `quota` (`status` ok / exhausted / unknown, `windows[].remaining_percent` + `resets_at`, `balance`). It is information, not a routing rule: `exhausted` means that worker will most likely fail its turn — prefer another or tell the user when it resets; `unknown` means Bridge could not read it (unsupported CLI, API-key login, timeout), not that it is empty. Custom API/auth endpoints return `unknown`; cache expires at window reset. DSH balance is unsupported.
 
+For Claude, `quota.status` summarizes only the shared `5h` / `weekly` limits. Before dispatch, check the requested model's `weekly:opus` or `weekly:sonnet` window, even when status is `ok`. A zero `remaining_percent` means that model is exhausted; report its reset time or use an alternative allowed by the user's routing instructions. Missing or null readings mean unknown. Model-specific windows alone cannot establish the shared status.
+
 ## Step 2 — which worker
 
 User `instructions` override this.
