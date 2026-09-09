@@ -354,8 +354,9 @@ Every `list_agents` row carries a `quota` block so the coordinator can weigh how
 }
 ```
 
-- `status` is `ok`, `exhausted` (a window is fully used, or the account is blocked), or `unknown`. `unknown` means Bridge could not read the number — the reason is in `detail` — and never that the quota is empty. Quota does not change `available`, and Bridge does not route on it: the rulebook tells the coordinator to treat it as information next to your `[coordinator] instructions`.
+- `status` is `ok`, `exhausted` (an applicable window is fully used, or the account is blocked), or `unknown`. `unknown` means Bridge could not read the number — the reason is in `detail` — and never that the quota is empty. Quota does not change `available`, and Bridge does not route on it: the rulebook tells the coordinator to treat it as information next to your `[coordinator] instructions`.
 - `windows[]` are the CLI's rolling limits; `balance` is optional provider-reported credit; `cached` means the reading was reused from the last lookup, `stale` that a fresh lookup failed and the last good reading is shown instead.
+- Claude's `status` summarizes only its shared `5h` and `weekly` limits because `list_agents` has no target model. The `weekly:opus` and `weekly:sonnet` windows retain their values, including zero: the coordinator must check the requested model's window before dispatch. A depleted model alone does not exhaust the shared status; without a usable shared reading, status is `unknown`. An `ok` shared status does not guarantee that a particular model has quota.
 
 Where each number comes from:
 

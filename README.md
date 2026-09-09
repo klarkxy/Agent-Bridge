@@ -136,6 +136,10 @@ weighs it against your instructions. Lookups are bounded by `[quota]
 timeout_sec` and cached up to `cache_sec` or the earliest window reset. Custom API/auth endpoints return `unknown` before credentials or cached quota are used; `agent-bridge --quota` prints a fresh
 reading. Details: [SETUP.md](SETUP.md#remaining-quota-in-list_agents).
 
+Claude's overall status covers its shared limits. Model-specific weekly limits
+remain in `windows`; check the requested model's window before dispatch, even
+when the overall status is `ok`.
+
 ### Coordinator mode
 
 Three levels. Default `auto`. First connect does not ask, and does not write `mode` into your overlay.
@@ -277,6 +281,9 @@ Codex（app-server）、Kimi Code（`kimi login`）
 自定义 API／认证端点不支持额度查询，直接返回 `unknown`，不会读取官方凭据或旧额度缓存。
 每次查询受 `[quota] timeout_sec` 限制，缓存最迟在 `cache_sec` 秒或最近窗口重置时失效；`agent-bridge --quota`
 可以打印一份不走缓存的读数。细节见 [SETUP.md](SETUP.md#remaining-quota-in-list_agents)。
+
+Claude 的整体状态只汇总通用额度；模型专属周额度保留在 `windows` 中。
+即使整体为 `ok`，派发前仍需检查指定模型的窗口。
 
 ### 协调者档位
 

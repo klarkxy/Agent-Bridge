@@ -83,7 +83,18 @@ def parse_claude_usage(payload: Mapping[str, Any] | None) -> QuotaStatus:
         windows.append(window_from_reset(name, remaining, block.get("resets_at")))
     if not windows:
         return unknown_quota("claude usage payload had no five_hour/seven_day windows", source=SOURCE)
-    return summarize_quota(windows, source=SOURCE)
+    # list_agents has no target model: dispatch selects it later. An optional
+    # model's weekly cap must not exhaust the shared account quota.
+    shared = [window for window in windows if window.name in ("5h", "weekly")]
+    status = summarize_quota(shared, source=SOURCE)
+    status.windows = windows
+    if len(shared) != len(windows):
+        prefix = "Shared Claude quota is unknown. " if status.status == "unknown" else ""
+        status.detail = (
+            prefix + "Status covers shared limits only; check weekly:opus/weekly:sonnet "
+            "for the requested model before dispatch."
+        )
+    return status
 
 
 async def fetch_claude_quota(cfg: AgentConfig, env: Mapping[str, str]) -> QuotaStatus:

@@ -552,7 +552,8 @@ def test_parse_claude_usage_windows():
         "seven_day_opus": {"utilization": 100.0, "resets_at": None},
     }
     status = parse_claude_usage(payload)
-    assert status.status == "exhausted"
+    assert status.status == "ok"
+    assert "requested model" in status.detail
     assert [(w.name, w.remaining_percent) for w in status.windows] == [
         ("5h", 26.0),
         ("weekly", 90.0),
@@ -560,6 +561,49 @@ def test_parse_claude_usage_windows():
     ]
     assert status.windows[0].resets_at == status.windows[1].resets_at == "2100-01-01T00:00:00+00:00"
     assert parse_claude_usage({}).status == "unknown"
+
+
+@pytest.mark.parametrize("depleted", ["seven_day_opus", "seven_day_sonnet"])
+def test_claude_model_limit_does_not_exhaust_shared_quota(depleted):
+    payload = {
+        "five_hour": {"utilization": 20},
+        "seven_day": {"utilization": 30},
+        "seven_day_opus": {"utilization": 10},
+        "seven_day_sonnet": {"utilization": 10},
+    }
+    payload[depleted]["utilization"] = 100
+    status = parse_claude_usage(payload)
+    assert status.status == "ok"
+    assert [window.remaining_percent for window in status.windows[:2]] == [80.0, 70.0]
+    assert sorted(window.remaining_percent for window in status.windows[2:]) == [0.0, 90.0]
+
+
+@pytest.mark.parametrize("depleted", ["five_hour", "seven_day"])
+def test_claude_shared_limit_still_exhausts_quota(depleted):
+    payload = {
+        "five_hour": {"utilization": 20},
+        "seven_day": {"utilization": 30},
+        "seven_day_opus": {"utilization": 10},
+        "seven_day_sonnet": {"utilization": 10},
+    }
+    payload[depleted]["utilization"] = 100
+    status = parse_claude_usage(payload)
+    assert status.status == "exhausted"
+    assert [window.remaining_percent for window in status.windows[2:]] == [90.0, 90.0]
+
+
+@pytest.mark.parametrize("utilization", [0, 100, None])
+def test_claude_model_windows_cannot_establish_shared_quota(utilization):
+    status = parse_claude_usage({
+        "five_hour": {"resets_at": FAR_FUTURE},
+        "seven_day_opus": {"utilization": utilization, "resets_at": FAR_FUTURE},
+    })
+    assert status.status == "unknown"
+    assert len(status.windows) == 2
+    assert status.windows[1].name == "weekly:opus"
+    assert status.windows[1].remaining_percent == (None if utilization is None else 100 - utilization)
+    assert status.windows[1].resets_at == "2100-01-01T00:00:00+00:00"
+    assert "Shared Claude quota is unknown" in status.detail
 
 
 @pytest.mark.asyncio
@@ -582,7 +626,10 @@ async def test_claude_provider_sends_oauth_headers(tmp_path: Path, monkeypatch):
     async def fake_get(url, *, headers=None, env=None, timeout=10.0):
         seen["url"] = url
         seen["headers"] = headers
-        return {"five_hour": {"utilization": 50, "resets_at": FAR_FUTURE}}
+        return {
+            "five_hour": {"utilization": 50, "resets_at": FAR_FUTURE},
+            "seven_day_opus": {"utilization": 100, "resets_at": FAR_FUTURE},
+        }
 
     monkeypatch.setattr("agent_bridge.quota_claude.get_json", fake_get)
     status = await fetch_claude_quota(
@@ -594,6 +641,8 @@ async def test_claude_provider_sends_oauth_headers(tmp_path: Path, monkeypatch):
     assert seen["headers"]["anthropic-beta"] == "oauth-2025-04-20"
     assert seen["headers"]["User-Agent"].startswith("claude-code/")
     assert status.status == "ok" and status.windows[0].remaining_percent == 50.0
+    assert status.windows[1].name == "weekly:opus" and status.windows[1].remaining_percent == 0.0
+    assert "requested model" in status.detail
 
 
 # --- config --------------------------------------------------------------------
