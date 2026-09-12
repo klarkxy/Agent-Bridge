@@ -3,6 +3,7 @@ from pathlib import Path
 from agent_bridge.dsh_home import (
     api_key_env_names,
     apply_dsh_worker_env,
+    canonicalize_dsh_command,
     default_model,
     discovered_dsh_acp_commands,
     dsh_command_problem,
@@ -164,6 +165,16 @@ def test_appends_bridge_cordis_when_missing(monkeypatch, tmp_path: Path):
     assert rewritten[:3] == ["dsh-acp-demo", "--config", str(bundled_dsh_cordis())]
 
 
+def test_keeps_native_dsh_acp_profile_without_bridge_cordis():
+    command = ["dsh", "--profile", "acp"]
+    assert with_bridge_cordis(command) == command
+
+
+def test_keeps_native_dsh_acp_node_entry_without_bridge_cordis(tmp_path: Path):
+    command = ["node", str(tmp_path / "dsh" / "lib" / "bin.js"), "--profile", "acp"]
+    assert with_bridge_cordis(command) == command
+
+
 def test_keeps_explicit_custom_cordis(tmp_path: Path):
     custom = str(tmp_path / "mine.yml")
     rewritten = with_bridge_cordis(["dsh-acp-demo", "--config", custom])
@@ -203,12 +214,54 @@ def test_unwraps_windows_npm_shim(tmp_path: Path, monkeypatch):
     js = tmp_path / "node_modules" / "@deepseek-ai" / "dsh-acp-demo" / "lib" / "bin.js"
     js.parent.mkdir(parents=True)
     js.write_text("console.log(1)\n", encoding="utf-8")
+    native_js = tmp_path / "node_modules" / "@deepseek-ai" / "dsh" / "lib" / "bin.js"
+    native_js.parent.mkdir(parents=True)
+    native_js.write_text("console.log(2)\n", encoding="utf-8")
     shim = tmp_path / "dsh-acp-demo.cmd"
     shim.write_text("@echo off\n", encoding="utf-8")
     monkeypatch.setattr("agent_bridge.dsh_home.shutil.which", lambda name: "C:/node.exe" if name == "node" else None)
     unwrapped = unwrap_npm_shim([str(shim)])
     assert unwrapped is not None
     assert unwrapped[-1] == str(js)
+
+
+def test_unwraps_windows_native_dsh_npm_shim(tmp_path: Path, monkeypatch):
+    js = tmp_path / "node_modules" / "@deepseek-ai" / "dsh" / "lib" / "bin.js"
+    js.parent.mkdir(parents=True)
+    js.write_text("console.log(1)\n", encoding="utf-8")
+    shim = tmp_path / "dsh.cmd"
+    shim.write_text("@echo off\n", encoding="utf-8")
+    monkeypatch.setattr("agent_bridge.dsh_home.shutil.which", lambda name: "C:/node.exe" if name == "node" else None)
+    command = canonicalize_dsh_command([str(shim), "--profile", "acp"])
+    assert command == ["C:/node.exe", str(js), "--profile", "acp"]
+    assert dsh_command_problem(command) is None
+
+
+def test_discovers_native_dsh_acp_from_windows_npm_shim(tmp_path: Path, monkeypatch):
+    package = tmp_path / "node_modules" / "@deepseek-ai" / "dsh"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text(
+        '{"version":"0.1.3-alpha.2","dependencies":{"@deepseek-ai/dsh-acp-app":"^0.1.3-alpha.2"}}',
+        encoding="utf-8",
+    )
+    js = package / "lib" / "bin.js"
+    js.parent.mkdir()
+    js.write_text("console.log(1)\n", encoding="utf-8")
+    shim = tmp_path / "dsh.cmd"
+    shim.write_text("@echo off\n", encoding="utf-8")
+
+    def which(name: str) -> str | None:
+        if name == "dsh":
+            return str(shim)
+        if name == "node":
+            return "C:/node.exe"
+        return None
+
+    monkeypatch.setattr("agent_bridge.dsh_home.shutil.which", which)
+    monkeypatch.setattr("agent_bridge.dsh_home.npm_global_prefixes", lambda: [])
+    monkeypatch.setattr("agent_bridge.dsh_home.dsh_acp_install_dir", lambda home=None: tmp_path / "absent")
+    found = discovered_dsh_acp_commands()
+    assert found == [["C:/node.exe", str(js), "--profile", "acp"]]
 
 
 def test_materializes_cordis_beside_acp_modules(tmp_path: Path):
@@ -237,6 +290,22 @@ def test_discovers_explicit_bin_and_harness_checkout(tmp_path: Path, monkeypatch
     found = discovered_dsh_acp_commands()
     assert [explicit] == [Path(cmd[-1]) for cmd in found[:1]]
     assert any(Path(cmd[-1]) == built for cmd in found)
+
+
+def test_discovers_native_dsh_acp_before_legacy_demo(monkeypatch, tmp_path: Path):
+    monkeypatch.delenv("DSH_ACP_BIN", raising=False)
+    monkeypatch.delenv("DSH_HARNESS", raising=False)
+    monkeypatch.delenv("DEEPSEEK_HARNESS", raising=False)
+    monkeypatch.delenv("DSH_CHECKOUT", raising=False)
+    monkeypatch.setattr(
+        "agent_bridge.dsh_home.dsh_builtin_acp_command",
+        lambda: ["dsh", "--profile", "acp"],
+    )
+    monkeypatch.setattr("agent_bridge.dsh_home.dsh_acp_install_dir", lambda home=None: tmp_path / "absent")
+    monkeypatch.setattr("agent_bridge.dsh_home.npm_global_prefixes", lambda: [])
+    monkeypatch.setattr("agent_bridge.dsh_home.shutil.which", lambda name: None)
+    found = discovered_dsh_acp_commands()
+    assert found[0] == ["dsh", "--profile", "acp"]
 
 
 def test_unbuilt_checkout_without_tsx_is_ignored(tmp_path: Path, monkeypatch):

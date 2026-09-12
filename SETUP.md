@@ -54,7 +54,7 @@ The `command` above is the `uv tool` shim. If `uv tool dir --bin` is not `%USERP
 
 DSH does **not** require `DEEPSEEK_API_KEY`. It uses whatever provider the user already configured in DSH (`%USERPROFILE%\.dsh\settings.yaml` and `.credentials.yaml`). Add extra key names to `env_vars` / `[env.inherit]` only if that user's DSH `apiKeyEnv` points at a process environment variable instead of the credentials file.
 
-The product `dsh` CLI is not an ACP server (DeepSeek ships ACP as `@deepseek-ai/dsh-acp-demo`). Any user needs that published package — Bridge does not vendor a checkout path. Discovery order: `DSH_ACP_BIN`, PATH `dsh-acp-demo`, the user's npm global prefix, `$AGENT_BRIDGE_HOME/dsh-acp`, then a *built* `$DSH_HARNESS` checkout.
+Current `dsh` releases serve ACP through the built-in `dsh --profile acp` profile. Bridge prefers that profile when `@deepseek-ai/dsh-acp-app` is present in the installed dsh package. Older dsh releases can use the published `@deepseek-ai/dsh-acp-demo` package. Discovery order: `DSH_ACP_BIN`, native dsh ACP, PATH `dsh-acp-demo`, the user's npm global prefix, `$AGENT_BRIDGE_HOME/dsh-acp`, then a *built* `$DSH_HARNESS` checkout.
 
 ```powershell
 npm install -g @deepseek-ai/dsh-acp-demo

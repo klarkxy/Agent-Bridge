@@ -150,6 +150,22 @@ def installed_dsh_version() -> str | None:
     return version if isinstance(version, str) and version else None
 
 
+def dsh_builtin_acp_command() -> list[str] | None:
+    """Return dsh's native ACP profile when the installed CLI provides it."""
+    executable = shutil.which("dsh")
+    package_dir = find_dsh_package_dir()
+    if not executable or package_dir is None:
+        return None
+    try:
+        package = json.loads(package_dir.joinpath("package.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    dependencies = package.get("dependencies")
+    if not isinstance(dependencies, Mapping) or "@deepseek-ai/dsh-acp-app" not in dependencies:
+        return None
+    return [executable, "--profile", "acp"]
+
+
 def dsh_acp_packages() -> tuple[str, ...]:
     version = installed_dsh_version() or "0.1.0-rc.7"
     plugins = tuple(f"@deepseek-ai/{name}@{version}" for name in _DSH_ACP_PLUGINS)
@@ -160,7 +176,7 @@ def dsh_acp_install_hint() -> str:
     version = installed_dsh_version() or "<same-as-dsh>"
     prefix = dsh_acp_install_dir()
     return (
-        "product `dsh` has no ACP profile; any user installs the published "
+        "if the installed `dsh` has no built-in ACP profile, install the published "
         f"`@deepseek-ai/dsh-acp-demo@{version}` on PATH "
         f'(npm -g) or under "{prefix}" (see scripts/install_dsh_acp.py); '
         "optional DSH_ACP_BIN / DSH_HARNESS override a built checkout"
@@ -201,8 +217,28 @@ def unwrap_npm_shim(command: list[str]) -> list[str] | None:
     return None
 
 
+def unwrap_native_dsh_npm_shim(command: list[str]) -> list[str] | None:
+    """Turn a native dsh Windows npm shim into its Node entry point."""
+    if not command:
+        return None
+    first = Path(command[0])
+    if first.name.lower() not in {"dsh.cmd", "dsh.bat"}:
+        return None
+    node = shutil.which("node")
+    if not node:
+        return None
+    candidates = [
+        first.parent / "node_modules" / "@deepseek-ai" / "dsh" / "lib" / "bin.js",
+        first.parent.parent / "@deepseek-ai" / "dsh" / "lib" / "bin.js",
+    ]
+    for js in candidates:
+        if js.is_file():
+            return [node, str(js), *command[1:]]
+    return None
+
+
 def canonicalize_dsh_command(command: list[str]) -> list[str]:
-    return unwrap_npm_shim(command) or command
+    return unwrap_native_dsh_npm_shim(command) or unwrap_npm_shim(command) or command
 
 
 def dsh_command_problem(command: list[str]) -> str | None:
@@ -288,6 +324,10 @@ def discovered_dsh_acp_commands() -> list[list[str]]:
             add([node, str(path)])
         else:
             add([explicit])
+
+    builtin = dsh_builtin_acp_command()
+    if builtin:
+        add(builtin)
 
     for name in ("dsh-acp-demo", "dsh-acp-demo.cmd"):
         exe = shutil.which(name)
@@ -402,6 +442,11 @@ def dsh_cordis_for_launch(command: list[str] | None = None) -> Path:
 
 
 def with_bridge_cordis(command: list[str]) -> list[str]:
+    # Current dsh owns the ACP profile and its complete plugin composition.
+    # Passing the legacy bridge cordis file would make the new launcher reject
+    # the unsupported --config argument and would mix incompatible plugin eras.
+    if any(command[index : index + 2] == ["--profile", "acp"] for index in range(len(command) - 1)):
+        return command
     cordis = str(dsh_cordis_for_launch(command))
     rewritten = []
     replaced = False
