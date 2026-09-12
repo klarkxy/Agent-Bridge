@@ -241,6 +241,13 @@ def canonicalize_dsh_command(command: list[str]) -> list[str]:
     return unwrap_native_dsh_npm_shim(command) or unwrap_npm_shim(command) or command
 
 
+def command_has_native_acp(command: list[str]) -> bool:
+    """True when the command selects dsh's built-in ACP profile."""
+    if "--profile=acp" in command:
+        return True
+    return any(command[index : index + 2] == ["--profile", "acp"] for index in range(len(command) - 1))
+
+
 def dsh_command_problem(command: list[str]) -> str | None:
     command = canonicalize_dsh_command(command)
     first = Path(command[0]) if command else Path()
@@ -445,7 +452,7 @@ def with_bridge_cordis(command: list[str]) -> list[str]:
     # Current dsh owns the ACP profile and its complete plugin composition.
     # Passing the legacy bridge cordis file would make the new launcher reject
     # the unsupported --config argument and would mix incompatible plugin eras.
-    if any(command[index : index + 2] == ["--profile", "acp"] for index in range(len(command) - 1)):
+    if command_has_native_acp(command):
         return command
     cordis = str(dsh_cordis_for_launch(command))
     rewritten = []

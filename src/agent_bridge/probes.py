@@ -11,6 +11,7 @@ from agent_bridge.config import AgentConfig, EnvConfig
 from agent_bridge.devin_meta import apply_devin_env
 from agent_bridge.dsh_home import (
     apply_dsh_worker_env,
+    command_has_native_acp,
     default_model,
     dsh_home,
     installed_dsh_version,
@@ -146,7 +147,15 @@ async def probe_agent(cfg: AgentConfig, env_config: EnvConfig | None = None) -> 
             details.append(f"dsh-model={selection[0]}/{selection[1]}")
         else:
             details.append("dsh-model=unset (DSH composition default)")
-        details.append("effort=off|low|high|max via dispatch_task.effort; same session model change respawns")
+        if command_has_native_acp(command):
+            details.append(
+                "native acp profile: model=provider/model or id, effort=off|low|high|max "
+                "via session/set_config_option"
+            )
+        else:
+            details.append(
+                "effort=off|low|high|max via dispatch_task.effort; same session model change respawns"
+            )
 
     if cfg.name == "antigravity":
         details.append("model=agy models slugs e.g. gemini-3.7-flash; effort=low|medium|high")

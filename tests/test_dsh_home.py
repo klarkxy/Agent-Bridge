@@ -4,6 +4,7 @@ from agent_bridge.dsh_home import (
     api_key_env_names,
     apply_dsh_worker_env,
     canonicalize_dsh_command,
+    command_has_native_acp,
     default_model,
     discovered_dsh_acp_commands,
     dsh_command_problem,
@@ -173,6 +174,20 @@ def test_keeps_native_dsh_acp_profile_without_bridge_cordis():
 def test_keeps_native_dsh_acp_node_entry_without_bridge_cordis(tmp_path: Path):
     command = ["node", str(tmp_path / "dsh" / "lib" / "bin.js"), "--profile", "acp"]
     assert with_bridge_cordis(command) == command
+
+
+def test_keeps_native_dsh_acp_equals_form_without_bridge_cordis():
+    command = ["dsh", "--profile=acp"]
+    assert with_bridge_cordis(command) == command
+
+
+def test_command_has_native_acp_detects_both_profile_forms():
+    assert command_has_native_acp(["dsh", "--profile", "acp"])
+    assert command_has_native_acp(["dsh", "--profile=acp"])
+    assert command_has_native_acp(["node", "bin.js", "--profile", "acp"])
+    assert not command_has_native_acp(["dsh-acp-demo"])
+    assert not command_has_native_acp(["dsh", "--profile", "acp-extra"])
+    assert not command_has_native_acp(["dsh", "--profile"])
 
 
 def test_keeps_explicit_custom_cordis(tmp_path: Path):
