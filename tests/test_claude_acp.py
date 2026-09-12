@@ -242,7 +242,7 @@ async def test_a_rejected_effort_only_warns():
 
 @pytest.mark.asyncio
 async def test_revive_uses_resume_to_skip_history_replay():
-    adapter, live, session = build()
+    adapter, live, _session = build()
     await adapter._call_load_session(live.conn, ".", "ses_abc")
     assert ("resume", "ses_abc") in live.conn.calls
     assert not any(call[0] == "load" for call in live.conn.calls)
@@ -251,7 +251,7 @@ async def test_revive_uses_resume_to_skip_history_replay():
 @pytest.mark.asyncio
 async def test_non_claude_agents_are_untouched_by_the_claude_path():
     adapter, live, session = build(
-        agent_name="cursor", session_kwargs={"model": "x", "effort": "high"}
+        agent_name="grok", session_kwargs={"model": "x", "effort": "high"}
     )
     await adapter._sync_claude_selection(live, session)
     assert live.conn.calls == []

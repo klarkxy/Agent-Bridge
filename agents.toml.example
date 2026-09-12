@@ -12,6 +12,12 @@
 # [server]
 # idle_exit_sec = 7200
 
+# Cancel a turn whose worker has produced no output for this long (seconds).
+# Default 1800; 0 disables. Raise it for a worker that runs long silent
+# builds or test suites. The task then ends failed / stop_reason "stalled".
+# [agents.grok]
+# stall_timeout_sec = 3600
+
 # Dispatch policy: mode = manual | auto | eager (default auto).
 # instructions is free text the coordinator reads via list_agents; it
 # overrides the default worker split and persists across sessions.
@@ -19,6 +25,19 @@
 # mode = "auto"
 # instructions = """Research goes to antigravity. Coding goes to grok.
 # Long single-file ports go to kimi (k3-256k)."""
+
+# Remaining quota returned with each list_agents row (agents[].quota).
+# Bridge only reports it; routing stays with the coordinator and your
+# instructions. Workers Bridge cannot query answer status = "unknown".
+# Custom API/auth endpoints are unsupported; cache expires at window reset.
+# DSH balance lookup is unsupported.
+# experimental = true also reads the private endpoints Grok Build's and
+# Claude Code's own /usage commands call (OAuth login only).
+# [quota]
+# enabled = true
+# timeout_sec = 4
+# cache_sec = 300
+# experimental = false
 
 # Optional. Only if a worker actually reads that variable from the process
 # environment. DSH credentials usually live in ~/.dsh/.credentials.yaml.

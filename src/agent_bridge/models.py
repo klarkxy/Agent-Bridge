@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import re
-import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import PurePosixPath
 from typing import Any
@@ -11,7 +10,7 @@ from pydantic import BaseModel, Field
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def iso(dt: datetime | None = None) -> str:
@@ -51,15 +50,6 @@ def normalize_effort(raw: str | None) -> str | None:
     if value not in EFFORTS:
         raise ValueError(f"effort must be one of off, low, medium, high, max (got {raw!r})")
     return value
-
-
-def normalize_request_id(raw: str | None) -> str | None:
-    if raw is None:
-        return None
-    try:
-        return str(uuid.UUID(raw.strip()))
-    except (AttributeError, ValueError) as exc:
-        raise ValueError("request_id must be a UUID") from exc
 
 
 def normalize_task_key(raw: str | None) -> str | None:
@@ -179,8 +169,6 @@ class Task(BaseModel):
     requested_model: str | None = None
     requested_effort: str | None = None
     request_id: str | None = None
-    requested_session_id: str | None = None
-    requested_title: str | None = None
     task_key: str | None = None
     task_mode: str | None = None
     write_paths: list[str] = Field(default_factory=list)
@@ -191,7 +179,10 @@ class Task(BaseModel):
     status: TaskStatus = TaskStatus.queued
     stop_reason: str | None = None
     result_text: str = ""
+    result_chars: int = 0
     files_changed: list[str] = Field(default_factory=list)
+    files_changed_total: int = 0
+    files_changed_truncated: bool = False
     usage: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
     warnings: list[str] = Field(default_factory=list)

@@ -27,24 +27,49 @@ DEFAULT_INHERIT_KEYS = (
     "KIMI_API_KEY",
     "KIMI_BASE_URL",
     "KIMI_CODE_BASE_URL",
+    "KIMI_CODE_OAUTH_HOST",
+    "KIMI_OAUTH_HOST",
+    "KIMI_MODEL_BASE_URL",
+    "KIMI_MODEL_NAME",
+    "KIMI_MODEL_API_KEY",
+    "KIMI_MODEL_PROVIDER_TYPE",
     "MOONSHOT_API_KEY",
     "DEEPSEEK_API_KEY",
     "OPENCODE_API_KEY",
     "XAI_API_KEY",
     "GROK_API_KEY",
+    "GROK_HOME",
+    "GROK_AUTH_PATH",
+    "GROK_CLI_CHAT_PROXY_BASE_URL",
+    "GROK_XAI_API_BASE_URL",
+    "GROK_MODELS_BASE_URL",
+    "GROK_MODELS_LIST_URL",
+    "GROK_OIDC_ISSUER",
+    "GROK_OIDC_CLIENT_ID",
+    "GROK_OAUTH2_ISSUER",
+    "GROK_OAUTH2_CLIENT_ID",
+    "GROK_LOCAL_AUTH",
+    "GROK_AUTH_PROVIDER_COMMAND",
+    "GROK_MANAGED_CONFIG_URL",
+    "GROK_CODE_XAI_API_KEY",
     "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
     "CODEX_API_KEY",
     "CODEX_CLI_PATH",
     "CODEX_HOME",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
     "OPENROUTER_API_KEY",
+    "WINDSURF_API_KEY",
     "GOOGLE_API_KEY",
     "GEMINI_API_KEY",
     "CLOUDFLARE_API_TOKEN",
@@ -70,6 +95,7 @@ class AgentConfig(BaseModel):
     session_meta: dict[str, Any] = Field(default_factory=dict)
     revivable: bool = False
     idle_unload_sec: int = 0
+    stall_timeout_sec: int = Field(default=1800, ge=0)
     print_timeout: str = "120m"
 
 
@@ -87,6 +113,21 @@ class ServerConfig(BaseModel):
     """Process-level server behavior (idle self-exit for abandoned MCP instances)."""
 
     idle_exit_sec: int = 7200
+
+
+class QuotaConfig(BaseModel):
+    """Remaining-quota lookup that rides along with ``list_agents``.
+
+    ``timeout_sec`` bounds one worker's lookup; ``cache_sec`` is how long a
+    reading is reused before the CLI is asked again. ``experimental`` unlocks
+    the workers whose only quota source is the private endpoint their own
+    ``/usage`` command calls (Grok Build, Claude Code).
+    """
+
+    enabled: bool = True
+    timeout_sec: float = Field(default=4.0, gt=0)
+    cache_sec: float = Field(default=300.0, ge=0)
+    experimental: bool = False
 
 
 COORDINATOR_MODES = ("manual", "auto", "eager")
@@ -140,6 +181,7 @@ class AppConfig(BaseModel):
     env: EnvConfig = Field(default_factory=EnvConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)
     coordinator: CoordinatorConfig = Field(default_factory=CoordinatorConfig)
+    quota: QuotaConfig = Field(default_factory=QuotaConfig)
     warnings: list[str] = Field(default_factory=list)
 
     def get(self, name: str) -> AgentConfig:
@@ -181,7 +223,8 @@ def _coerce_env(raw: dict[str, Any]) -> dict[str, Any]:
     block = raw.get("env")
     if not isinstance(block, dict):
         return {}
-    proxy = block.get("proxy") if isinstance(block.get("proxy"), dict) else {}
+    raw_proxy = block.get("proxy")
+    proxy: dict[str, Any] = raw_proxy if isinstance(raw_proxy, dict) else {}
     out: dict[str, Any] = {}
     if "inherit" in block and block["inherit"] is not None:
         out["inherit"] = [str(item) for item in block["inherit"]]
@@ -202,7 +245,8 @@ def _merge_env(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
     out = dict(base)
     for key, value in overlay.items():
         if key == "set" and isinstance(value, dict):
-            current = out.get("set") if isinstance(out.get("set"), dict) else {}
+            raw_set = out.get("set")
+            current: dict[str, Any] = raw_set if isinstance(raw_set, dict) else {}
             out["set"] = {**current, **value}
         else:
             out[key] = value
@@ -216,6 +260,22 @@ def _coerce_server(raw: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if "idle_exit_sec" in block and block["idle_exit_sec"] is not None:
         out["idle_exit_sec"] = int(block["idle_exit_sec"])
+    return out
+
+
+def _coerce_quota(raw: dict[str, Any]) -> dict[str, Any]:
+    block = raw.get("quota")
+    if not isinstance(block, dict):
+        return {}
+    out: dict[str, Any] = {}
+    if block.get("enabled") is not None:
+        out["enabled"] = bool(block["enabled"])
+    if block.get("timeout_sec") is not None:
+        out["timeout_sec"] = float(block["timeout_sec"])
+    if block.get("cache_sec") is not None:
+        out["cache_sec"] = float(block["cache_sec"])
+    if block.get("experimental") is not None:
+        out["experimental"] = bool(block["experimental"])
     return out
 
 
@@ -242,7 +302,44 @@ def _toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-_COORDINATOR_BLOCK = re.compile(r"(?ms)^\[coordinator\][^\n]*\n?.*?(?=^\[|\Z)")
+_COORDINATOR_HEADER = re.compile(r"(?m)^\[coordinator\][ \t]*(#[^\n]*)?\n?")
+_NEXT_TABLE = re.compile(r"(?m)^\[")
+
+
+def _trim_trailing_blank_and_comment_lines(text: str, start: int, end: int) -> int:
+    lines = text[start:end].splitlines(keepends=True)
+    while lines and (not lines[-1].strip() or lines[-1].lstrip().startswith("#")):
+        lines.pop()
+    return start + sum(len(line) for line in lines)
+
+
+def _coordinator_span(text: str) -> tuple[int, int] | None:
+    """Return the [coordinator] table span, skipping `[` lines inside strings."""
+    header = _COORDINATOR_HEADER.search(text)
+    if header is None:
+        return None
+    start = header.start()
+    header_end = header.end()
+    ends = [header_end + match.start() for match in _NEXT_TABLE.finditer(text[header_end:])]
+    ends.append(len(text))
+    for end in ends:
+        block = text[start:end]
+        rest = text[:start] + text[end:]
+        try:
+            parsed_block = tomllib.loads(block)
+            parsed_rest = tomllib.loads(rest) if rest.strip() else {}
+        except tomllib.TOMLDecodeError:
+            continue
+        if set(parsed_block) == {"coordinator"} and "coordinator" not in parsed_rest:
+            trimmed = _trim_trailing_blank_and_comment_lines(text, start, end)
+            try:
+                parsed_trimmed = tomllib.loads(text[start:trimmed])
+            except tomllib.TOMLDecodeError:
+                return (start, end)
+            if set(parsed_trimmed) == {"coordinator"}:
+                return (start, trimmed)
+            return (start, end)
+    raise ValueError("could not isolate the [coordinator] table")
 
 
 def write_coordinator_overlay(
@@ -260,26 +357,55 @@ def write_coordinator_overlay(
     path = home / "agents.toml"
     text = path.read_text(encoding="utf-8") if path.is_file() else ""
     try:
-        existing = tomllib.loads(text).get("coordinator", {})
+        original = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
         raise ValueError(f"{path} is not valid TOML ({exc}); fix it by hand first") from exc
 
+    existing = original.get("coordinator", {}) if isinstance(original.get("coordinator"), dict) else {}
     new_mode = mode if mode is not None else existing.get("mode")
     new_instructions = instructions if instructions is not None else existing.get("instructions")
 
     lines = ["[coordinator]"]
+    written_mode: str | None = None
     if new_mode is not None:
-        lines.append(f'mode = "{normalize_coordinator_mode(str(new_mode), strict=True)}"')
+        written_mode = normalize_coordinator_mode(str(new_mode), strict=True)
+        lines.append(f'mode = "{written_mode}"')
     if new_instructions is not None:
         lines.append(f"instructions = {_toml_string(str(new_instructions))}")
     block = "\n".join(lines) + "\n"
 
-    match = _COORDINATOR_BLOCK.search(text)
-    if match:
-        text = text[: match.start()] + block + text[match.end() :]
+    try:
+        span = _coordinator_span(text)
+    except ValueError as exc:
+        raise ValueError(f"could not isolate the [coordinator] table in {path}") from exc
+    if span:
+        start, end = span
+        new_text = text[:start] + block + text[end:]
     else:
-        text = block if not text.strip() else text.rstrip() + "\n\n" + block
-    atomic_write_text(path, text)
+        new_text = block if not text.strip() else text.rstrip() + "\n\n" + block
+
+    try:
+        parsed = tomllib.loads(new_text)
+        coord = parsed.get("coordinator")
+        if not isinstance(coord, dict):
+            raise ValueError("missing coordinator table")
+        if written_mode is not None and coord.get("mode") != written_mode:
+            raise ValueError("mode mismatch")
+        if new_instructions is not None:
+            got = (coord.get("instructions") or "").strip()
+            expected = str(new_instructions or "").strip()
+            if got != expected:
+                raise ValueError("instructions mismatch")
+        original_other = {key: value for key, value in original.items() if key != "coordinator"}
+        parsed_other = {key: value for key, value in parsed.items() if key != "coordinator"}
+        if original_other != parsed_other:
+            raise ValueError("other tables changed")
+    except (tomllib.TOMLDecodeError, ValueError) as exc:
+        raise ValueError(
+            "refusing to write agents.toml: rewritten [coordinator] block failed self-check"
+        ) from exc
+
+    atomic_write_text(path, new_text)
     return path
 
 
@@ -292,8 +418,15 @@ def _merge_server(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, An
 def load_config(home: Path | None = None) -> AppConfig:
     bundled_raw = _load_toml(bundled_agents_toml())
     user_home = home or bridge_home()
-    overlay_raw = _load_toml(user_home / "agents.toml")
-    supported_sections = {"agents", "env", "server", "coordinator"}
+    overlay_path = user_home / "agents.toml"
+    try:
+        overlay_raw = _load_toml(overlay_path)
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(
+            f"{overlay_path} is not valid TOML: {exc}. "
+            "Fix or delete the file, then restart the Bridge."
+        ) from exc
+    supported_sections = {"agents", "env", "server", "coordinator", "quota"}
     unsupported = sorted(set(overlay_raw) - supported_sections)
     warnings = []
     if unsupported:
@@ -329,10 +462,12 @@ def load_config(home: Path | None = None) -> AppConfig:
         coord_raw["mode"] = env_mode
     coord_raw["mode"] = normalize_coordinator_mode(coord_raw.get("mode"))
     coordinator = CoordinatorConfig.model_validate(coord_raw)
+    quota = QuotaConfig.model_validate({**_coerce_quota(bundled_raw), **_coerce_quota(overlay_raw)})
     return AppConfig(
         agents=agents,
         env=env,
         server=server,
         coordinator=coordinator,
+        quota=quota,
         warnings=warnings,
     )

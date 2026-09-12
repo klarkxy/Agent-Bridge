@@ -10,7 +10,7 @@ from mcp_types import ToolAnnotations
 from agent_bridge.logging_setup import setup_logging
 from agent_bridge.models import DEFAULT_WAIT_SEC
 from agent_bridge.paths import ensure_home
-from agent_bridge.registry import Registry
+from agent_bridge.registry import RESULT_PAGE_MAX_CHARS, Registry
 
 READ_ONLY = ToolAnnotations(
     read_only_hint=True,
@@ -37,7 +37,7 @@ async def lifespan(_server: MCPServer[Registry]) -> AsyncIterator[Registry]:
 INSTRUCTIONS = (
     "Agent Bridge executes already-defined external TaskNode leaves through local "
     "worker CLIs (Grok, Kimi Code, "
-    "Antigravity, DeepSeek Harness, OpenCode, Claude Code, Codex CLI) and keeps their "
+    "Antigravity, DeepSeek Harness, OpenCode, Claude Code, Codex CLI, Devin CLI) and keeps their "
     "sessions resumable.\n"
     "Hard rules: workers are reached only through these tools — never drive the "
     "worker CLIs or GUIs directly. The top-level coordinator owns routing, Git, "
@@ -45,15 +45,25 @@ INSTRUCTIONS = (
     "but descendants must not receive or call Bridge, own Git state, or accept "
     "results. dispatch_task.cwd is the coordinator's absolute workspace; Bridge never "
     "creates or merges worktrees. Pass request_id, task_key, task_mode, "
-    "write_paths, workspace_mode, and base_revision as attribution metadata. Reuse "
-    "the same request_id after a lost response so Bridge does not start the turn twice. "
+    "write_paths, workspace_mode, and base_revision as attribution metadata. "
     "A wait_task "
     "timeout is not failure; call it again. Verify results with get_result plus "
     "your own git diff — do not trust a worker's self-report. An empty Kimi "
     "result with non-empty warnings is a failed turn, not a no-op.\n"
     "Call list_agents first. Read coordinator.mode, coordinator.instructions, "
     "coordinator.runtime_context, and coordinator.dispatch_enabled. User "
-    "preferences in instructions override default worker routing. If "
+    "preferences in instructions override default worker routing. Each "
+    "agents[] row carries quota: status ok/exhausted/unknown, rolling windows "
+    "with remaining_percent and resets_at, and optional provider-reported balance for "
+    "workers. Custom API/auth endpoints are unsupported; cached readings expire at window reset. unknown means Bridge could not read it, not that it is empty; "
+    "an exhausted worker will most likely fail its turn. Quota is information "
+    "for you and the user, not a routing rule — instructions still decide. "
+    "Claude quota.status covers only shared 5h/weekly limits. Before dispatch, "
+    "check the requested model's weekly:opus or weekly:sonnet window even when "
+    "status is ok. A zero remaining_percent means that model is exhausted: "
+    "report its reset time or use an alternative allowed by the user's routing "
+    "instructions. Missing or null readings mean unknown; model-specific windows "
+    "alone cannot establish the shared status. If "
     "dispatch_enabled is false, this Bridge was inherited inside a worker "
     "process — do not call dispatch_task, set_preferences, cancel_task, "
     "or end_session. When "
@@ -69,31 +79,23 @@ def _registry(ctx: Context) -> Registry:
     if isinstance(lifespan_ctx, Registry):
         lifespan_ctx.touch_activity()
         return lifespan_ctx
-    if isinstance(lifespan_ctx, dict) and "registry" in lifespan_ctx:
-        registry = lifespan_ctx["registry"]
-        registry.touch_activity()
-        return registry
-    registry = getattr(lifespan_ctx, "registry", None)
-    if isinstance(registry, Registry):
-        registry.touch_activity()
-        return registry
     raise RuntimeError("Agent Bridge registry is not available")
 
 
 def _error(exc: Exception) -> dict[str, Any]:
-    return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "error_type": type(exc).__name__}
 
 
 @mcp.tool(annotations=READ_ONLY)
 async def list_agents(ctx: Context) -> dict[str, Any]:
-    """List configured workers, the reconstructed host/proxy environment, and the coordinator policy (mode, instructions, runtime_context, dispatch_enabled). Call this first. If dispatch_enabled is false, this is a nested worker-inherited instance — do not dispatch or set_preferences."""
+    """List configured workers, the reconstructed host/proxy environment, and the coordinator policy (mode, instructions, runtime_context, dispatch_enabled). Call this first. Each agents[] row also carries quota: status ok | exhausted | unknown, windows[] with remaining_percent / resets_at / resets_in_sec, optional balance when reported by the provider, cached / stale flags, and detail. unknown means the quota could not be read (unsupported CLI, API-key login, timeout) — not that it is empty. Custom API/auth endpoints are unsupported; cached readings expire at window reset. Quota never affects available; treat it as information, routing still follows coordinator.instructions. Claude status covers shared 5h/weekly limits only: before dispatch, check the requested model's weekly:opus or weekly:sonnet remaining_percent even if status is ok. Zero means that model is exhausted; report its reset time or use an alternative allowed by coordinator.instructions. Missing or null readings mean unknown; model-specific windows alone cannot establish shared status. If dispatch_enabled is false, this is a nested worker-inherited instance — do not dispatch or set_preferences."""
     try:
         registry = _registry(ctx)
         agents = await registry.list_agents()
         return {
             "ok": True,
             "agents": agents,
-            "env": registry.env_status(),
+            "env": await registry.env_status(),
             "coordinator": registry.coordinator_status(),
         }
     except Exception as exc:
@@ -132,7 +134,7 @@ async def dispatch_task(
     workspace_mode: str | None = None,
     base_revision: str | None = None,
 ) -> dict[str, Any]:
-    """Start one already-defined external TaskNode turn. cwd is the absolute coordinator-owned workspace; Bridge never creates or merges worktrees. Optional request_id/task_key/task_mode/write_paths/workspace_mode/base_revision are attribution metadata, not an OS sandbox. Reusing a recent request_id with the same payload returns the existing task; a conflicting payload is rejected. This prevents duplicate Bridge tasks, not exactly-once worker side effects. Pass session_id only to continue in the same cwd. Set user_requested=true only when the user explicitly asked for a worker (required in manual mode). Rejected when coordinator.dispatch_enabled is false. Returns immediately."""
+    """Start an external TaskNode turn. cwd is the absolute coordinator-owned workspace; Bridge never creates or merges worktrees. task_key/task_mode/write_paths/workspace_mode/base_revision are attribution metadata, not an OS sandbox. model/effort are optional coordinator choices (agy: --model/--effort/--new-project; grok: session/setModel after /new; kimi/cursor/opencode/claude/devin: session/set_config_option after new/resume, devin has no effort; dsh: spawn env, respawn if they change; codex: exec -m / -c model_reasoning_effort, off->none). Pass session_id to continue. Set user_requested=true only when the user explicitly asked for a worker (required in manual mode). Rejected when coordinator.dispatch_enabled is false, even with user_requested=true. For optional retry deduplication, supply a UUID request_id on the first call and replay the same ID and original arguments on retries; keep session_id omitted if it was originally omitted. Adding an ID only on retry cannot deduplicate the first call. Identical retries reuse the task in this Bridge instance while it is retained; different arguments are rejected. Normal dispatch validation still applies. Bindings are lost on restart and are not shared with other instances. Returns immediately."""
     try:
         result = await _registry(ctx).dispatch_task(
             agent=agent,
@@ -157,7 +159,7 @@ async def dispatch_task(
 
 @mcp.tool(annotations=READ_ONLY)
 async def wait_task(ctx: Context, task_id: str, timeout_sec: float = DEFAULT_WAIT_SEC) -> dict[str, Any]:
-    """Wait until a task finishes or timeout_sec elapses (default 180). Timeout is not failure; call wait_task again. Stay under the host MCP tool timeout (Codex tool_timeout_sec, typically 600)."""
+    """Wait until a task finishes or timeout_sec elapses (default 180). Timeout is not failure; call wait_task again. Stay under the host MCP tool timeout (Codex tool_timeout_sec, typically 600). Payloads carry silent_for_sec / stall_timeout_sec."""
     try:
         result = await _registry(ctx).wait_task(task_id, timeout_sec=timeout_sec)
         return {"ok": True, **result}
@@ -167,7 +169,7 @@ async def wait_task(ctx: Context, task_id: str, timeout_sec: float = DEFAULT_WAI
 
 @mcp.tool(annotations=READ_ONLY)
 async def check_task(ctx: Context, task_id: str) -> dict[str, Any]:
-    """Non-blocking status, elapsed time, and recent activity for a task."""
+    """Non-blocking status, elapsed time, and recent activity for a task. files_changed is capped at 200 paths; files_changed_total carries the real count. silent_for_sec is the time since the worker's last output; Bridge fails the task with stop_reason "stalled" once it passes stall_timeout_sec."""
     try:
         return {"ok": True, **_registry(ctx).check_task(task_id)}
     except Exception as exc:
@@ -175,10 +177,18 @@ async def check_task(ctx: Context, task_id: str) -> dict[str, Any]:
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def get_result(ctx: Context, task_id: str) -> dict[str, Any]:
-    """Return the truncated worker result, changed files, usage, and requested/observed model. For Grok, observed_model is the live sampler; the worker saying it is Grok 4.6 is not."""
+async def get_result(
+    ctx: Context,
+    task_id: str,
+    cursor: int = 0,
+    max_chars: int = RESULT_PAGE_MAX_CHARS,
+) -> dict[str, Any]:
+    """Return a page of the complete worker result plus changed files, usage, and requested/observed model. Continue with next_cursor while has_more is true. max_chars is capped at 60000. files_changed is capped at 200 paths; files_changed_total carries the real count. For Grok, observed_model is the live sampler; the worker saying it is Grok 4.6 is not."""
     try:
-        return {"ok": True, **_registry(ctx).get_result(task_id)}
+        return {
+            "ok": True,
+            **_registry(ctx).get_result(task_id, cursor=cursor, max_chars=max_chars),
+        }
     except Exception as exc:
         return _error(exc)
 
