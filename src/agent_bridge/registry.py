@@ -1098,10 +1098,10 @@ class Registry:
             )
         return rows
 
-    def session_scope(self) -> dict:
+    async def session_scope(self) -> dict:
         return {
             "scope": "current_instance",
-            "other_live_instances": count_sibling_servers(),
+            "other_live_instances": await self._sibling_count(),
         }
 
     async def end_session(self, session_id: str) -> dict:

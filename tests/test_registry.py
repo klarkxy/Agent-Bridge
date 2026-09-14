@@ -66,10 +66,10 @@ async def test_env_status_includes_config_warnings(bridge_home, monkeypatch):
     assert (await registry.env_status())["warnings"] == registry.config.warnings
 
 
-def test_session_scope_is_explicit(bridge_home, monkeypatch):
+async def test_session_scope_is_explicit(bridge_home, monkeypatch):
     registry = Registry.create(bridge_home)
     monkeypatch.setattr("agent_bridge.registry.count_sibling_servers", lambda: 3)
-    assert registry.session_scope() == {
+    assert await registry.session_scope() == {
         "scope": "current_instance",
         "other_live_instances": 3,
     }

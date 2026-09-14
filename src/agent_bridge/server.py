@@ -212,7 +212,7 @@ async def list_sessions(ctx: Context, active_only: bool = False) -> dict[str, An
         registry = _registry(ctx)
         return {
             "ok": True,
-            **registry.session_scope(),
+            **(await registry.session_scope()),
             "sessions": registry.list_sessions(active_only=active_only),
         }
     except Exception as exc:
