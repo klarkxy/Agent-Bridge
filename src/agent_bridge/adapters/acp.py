@@ -30,7 +30,7 @@ from agent_bridge.claude_meta import (
 )
 from agent_bridge.config import AgentConfig
 from agent_bridge.devin_meta import DEVIN_MODE_BYPASS, apply_devin_env
-from agent_bridge.dsh_home import prepare_dsh_launch, resolve_dsh_command
+from agent_bridge.dsh_home import command_has_native_acp, prepare_dsh_launch, resolve_dsh_command
 from agent_bridge.kimi_meta import KIMI_MODE_YOLO, resolve_kimi_thinking
 from agent_bridge.models import Session, Task, TurnResult, dsh_effort, grok_effort
 from agent_bridge.opencode_meta import resolve_opencode_effort
@@ -54,7 +54,7 @@ GROK_SET_MODEL_METHODS = ("session/setModel", "session/set_model")
 # These workers' session/load replays persisted history as session/update
 # notifications. session/resume is advertised and skips that replay.
 _RESUME_AGENTS = frozenset({"kimi", "opencode", "claude"})
-_CONFIG_OPTION_AGENTS = frozenset({"kimi", "opencode", "claude", "devin", "cursor"})
+_CONFIG_OPTION_AGENTS = frozenset({"kimi", "opencode", "claude", "devin", "cursor", "dsh"})
 _MODEL_EFFORT_AGENTS = frozenset({"grok", "dsh", "kimi", "opencode", "claude", "devin", "cursor"})
 
 # Handshake-style RPCs (initialize, session/new, session/load, setModel)
@@ -334,6 +334,42 @@ def dsh_needs_respawn(
     return applied_model != model or applied_effort != dsh_effort(effort)
 
 
+def _dsh_native_pair(value: str) -> list[Any] | None:
+    """Decode one native dsh model option value: ``["provider","model"]`` JSON."""
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, list) and len(parsed) == 2 else None
+
+
+def dsh_native_model_value(model: str, config_options: list[Any]) -> str | None:
+    """Map a coordinator ``provider/model`` or bare model onto an advertised value."""
+    _current, offered = config_option_values(config_options, "model")
+    provider = None
+    wanted = model
+    if "/" in model and not model.startswith("@"):
+        provider, _, wanted = model.partition("/")
+    parsed = [
+        (value, str(pair[0]), str(pair[1]))
+        for value in offered
+        if (pair := _dsh_native_pair(value)) is not None
+    ]
+    if provider is not None:
+        return next((value for value, p, m in parsed if p == provider and m == wanted), None)
+    return next((value for value, _p, m in parsed if m == wanted), None)
+
+
+def _dsh_native_model_label(value: str | None) -> str | None:
+    pair = _dsh_native_pair(value) if value else None
+    return f"{pair[0]}/{pair[1]}" if pair else None
+
+
+def _dsh_native_model_labels(config_options: list[Any]) -> list[str]:
+    _current, offered = config_option_values(config_options, "model")
+    return [_dsh_native_model_label(value) or value for value in offered]
+
+
 def _dump(obj: Any) -> Any:
     if obj is None:
         return None
@@ -579,6 +615,10 @@ class _Live:
         # set_config_option response: the only place model-specific parameters
         # such as thinking level and fast mode are published.
         self.config_options: list[Any] = []
+        # A resolved dsh launch on `--profile acp` selects model/effort through
+        # config options; the legacy demo read DSH_ACP_* spawn env instead.
+        self.dsh_native_acp = False
+        self.dsh_env_model: str | None = None
         # Warnings raised outside a turn (e.g. during ensure_session);
         # drained into the next TurnResult.
         self.pending_warnings: list[str] = []
@@ -756,8 +796,16 @@ class AcpAdapter(Adapter):
             session,
         )
         if self.agent.name == "dsh":
-            live.applied_model = session.model
-            live.applied_effort = dsh_effort(session.effort)
+            live.dsh_native_acp = command_has_native_acp(cmd)
+            if live.dsh_native_acp:
+                provider = env.get("DSH_ACP_PROVIDER")
+                model_name = env.get("DSH_ACP_MODEL")
+                live.dsh_env_model = (
+                    f"{provider}/{model_name}" if provider and model_name else model_name
+                )
+            else:
+                live.applied_model = session.model
+                live.applied_effort = dsh_effort(session.effort)
         return live
 
     def _new_session_meta(self, session: Session) -> dict[str, Any]:
@@ -770,10 +818,14 @@ class AcpAdapter(Adapter):
         extra = dict(meta or {})
         return await conn.new_session(cwd=cwd, mcp_servers=[], **extra)
 
-    async def _call_load_session(self, conn: Any, cwd: str, native_id: str) -> Any:
-        if self.agent.name in _RESUME_AGENTS:
-            # These workers replay persisted history as session/update
-            # notifications before session/load answers. session/resume skips it.
+    async def _call_load_session(
+        self, conn: Any, cwd: str, native_id: str, *, use_resume: bool | None = None
+    ) -> Any:
+        if use_resume is None:
+            use_resume = self.agent.name in _RESUME_AGENTS
+        if use_resume:
+            # kimi/opencode/claude replay persisted history as session/update
+            # on load; resume skips it. Native dsh implements only resume.
             return await conn.resume_session(
                 session_id=native_id,
                 cwd=cwd,
@@ -1164,6 +1216,7 @@ class AcpAdapter(Adapter):
         await self._sync_opencode_selection(live, session)
         await self._sync_claude_selection(live, session)
         await self._sync_devin_selection(live, session)
+        await self._sync_dsh_selection(live, session)
 
     async def _sync_claude_effort(self, live: _Live, session: Session) -> None:
         if not session.effort:
@@ -1193,6 +1246,64 @@ class AcpAdapter(Adapter):
             return
         live.applied_effort = level
 
+    async def _sync_dsh_selection(self, live: _Live, session: Session) -> None:
+        """Apply model and effort on the native ``dsh --profile acp`` app.
+
+        The legacy demo reads ``DSH_ACP_*`` spawn env, so a selection change
+        respawns the process. The native profile ignores that env and
+        publishes the standard ``model`` / ``reasoning_effort`` config options
+        instead. Without an explicit coordinator model Bridge applies the
+        ``settings.yaml`` default the env would have carried.
+        """
+        if self.agent.name != "dsh" or not live.dsh_native_acp:
+            return
+        requested = session.model or live.dsh_env_model
+        if requested and requested != live.applied_model:
+            target = dsh_native_model_value(requested, live.config_options)
+            if target is None:
+                if session.model:
+                    raise RuntimeError(
+                        f"dsh model {session.model!r} is not advertised by the native ACP "
+                        f"profile; session offers "
+                        f"{_dsh_native_model_labels(live.config_options) or 'no models'}"
+                    )
+                # Consumed: warn once, then let the bundle default stand.
+                live.dsh_env_model = None
+                message = (
+                    f"dsh settings default model {requested!r} is not advertised by the "
+                    "native ACP profile; the session keeps its bundle default"
+                )
+                log.warning("%s", message)
+                live.pending_warnings.append(message)
+            else:
+                current, _offered = config_option_values(live.config_options, "model")
+                if current != target:
+                    await self._set_config_option(live, session, "model", target)
+                live.applied_model = requested
+        if live.applied_model is None:
+            current, _offered = config_option_values(live.config_options, "model")
+            live.applied_model = _dsh_native_model_label(current)
+        mapped = dsh_effort(session.effort)
+        if mapped and mapped != live.applied_effort:
+            current_effort, offered_effort = config_option_values(
+                live.config_options, "reasoning_effort"
+            )
+            if mapped in offered_effort:
+                if current_effort != mapped:
+                    await self._set_config_option(live, session, "reasoning_effort", mapped)
+            else:
+                message = (
+                    f"dsh effort={session.effort} (native id {mapped!r}) is not advertised "
+                    f"for the current model; session offers "
+                    f"{offered_effort or 'no reasoning options'}"
+                )
+                log.warning("%s", message)
+                live.pending_warnings.append(message)
+            live.applied_effort = mapped
+        elif live.applied_effort is None:
+            current_effort, _offered = config_option_values(live.config_options, "reasoning_effort")
+            live.applied_effort = current_effort or None
+
     async def ensure_session(self, session: Session) -> None:
         live = self._live.get(session.session_id)
         if (
@@ -1202,7 +1313,7 @@ class AcpAdapter(Adapter):
             and live.conn is not None
             and session.native_session_id
         ):
-            if self.agent.name == "dsh" and dsh_needs_respawn(
+            if self.agent.name == "dsh" and not live.dsh_native_acp and dsh_needs_respawn(
                 live.applied_model,
                 live.applied_effort,
                 session.model,
@@ -1223,10 +1334,13 @@ class AcpAdapter(Adapter):
         live = await self._spawn(session)
         native = session.native_session_id
         if native and self.can_revive():
+            use_resume = self.agent.name in _RESUME_AGENTS or (
+                self.agent.name == "dsh" and live.dsh_native_acp
+            )
             try:
                 revived = await self._rpc(
-                    self._call_load_session(live.conn, session.cwd, native),
-                    "session/resume" if self.agent.name in _RESUME_AGENTS else "session/load",
+                    self._call_load_session(live.conn, session.cwd, native, use_resume=use_resume),
+                    "session/resume" if use_resume else "session/load",
                     session,
                 )
             except RpcTimeoutError:

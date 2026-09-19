@@ -151,8 +151,9 @@ idle_unload_sec = 0
 
 [agents.dsh]
 protocol = "acp"
-# Product `dsh` has no ACP profile. Bridge discovers a real ACP bin, in order:
-# DSH_ACP_BIN, PATH `dsh-acp-demo`, the user's npm global prefix,
+# New dsh releases expose ACP as `dsh --profile acp`; older releases use the
+# published demo. Discovery order is: DSH_ACP_BIN, native dsh ACP,
+# PATH `dsh-acp-demo`, the user's npm global prefix,
 # $AGENT_BRIDGE_HOME/dsh-acp, then a *built* $DSH_HARNESS checkout.
 # Providers come from that user's $DSH_HOME — do not pin a vendor here.
 command = ["dsh-acp-demo"]

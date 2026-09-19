@@ -1,6 +1,7 @@
 """Optional portable install of DeepSeek's published ACP package.
 
-Product ``dsh`` has no ACP profile. Any user can either:
+Current ``dsh`` releases include an ACP profile. Older releases can use the
+published demo package. Any user can either:
 
 - ``npm install -g @deepseek-ai/dsh-acp-demo`` (same prefix as their ``dsh``), or
 - run this helper, which writes ``$AGENT_BRIDGE_HOME/dsh-acp`` and does not
@@ -23,10 +24,14 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 # Imported after sys.path injection so the script works outside the package.
-from agent_bridge.dsh_home import dsh_acp_install_dir, dsh_acp_packages
+from agent_bridge.dsh_home import dsh_acp_install_dir, dsh_acp_packages, dsh_builtin_acp_command
 
 
 def main() -> int:
+    builtin = dsh_builtin_acp_command()
+    if builtin:
+        print("installed dsh provides native ACP: " + " ".join(builtin))
+        return 0
     npm = shutil.which("npm")
     if not npm:
         print("npm not found", file=sys.stderr)
