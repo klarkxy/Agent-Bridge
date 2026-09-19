@@ -25,6 +25,12 @@ class TaskStatus(StrEnum):
     cancelled = "cancelled"
 
 
+class FilesChangedState(StrEnum):
+    pending = "pending"
+    collected = "collected"
+    unavailable = "unavailable"
+
+
 class ProcState(StrEnum):
     spawning = "spawning"
     ready = "ready"
@@ -183,6 +189,7 @@ class Task(BaseModel):
     files_changed: list[str] = Field(default_factory=list)
     files_changed_total: int = 0
     files_changed_truncated: bool = False
+    files_changed_state: FilesChangedState = FilesChangedState.pending
     usage: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
     warnings: list[str] = Field(default_factory=list)
