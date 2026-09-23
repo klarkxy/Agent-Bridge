@@ -190,8 +190,13 @@ class Task(BaseModel):
     files_changed_total: int = 0
     files_changed_truncated: bool = False
     files_changed_state: FilesChangedState = FilesChangedState.pending
+    # Sources are capped with files_changed. A workspace observation can be
+    # another writer's change when the cwd is shared.
+    files_changed_provenance: dict[str, str] = Field(default_factory=dict)
     usage: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
+    error_details: dict[str, Any] | None = None
+    cancel_reason: str | None = None
     warnings: list[str] = Field(default_factory=list)
     created_at: str = Field(default_factory=iso)
     started_at: str | None = None

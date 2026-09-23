@@ -264,3 +264,51 @@ def recent_activity(events: list[dict[str, Any]], limit: int = 5) -> list[str]:
             break
     summaries.reverse()
     return summaries
+
+
+def events_for_task(
+    events: list[dict[str, Any]], task_id: str, started_at: str | None = None,
+    finished_at: str | None = None,
+) -> list[dict[str, Any]]:
+    """Scope a session transcript to one turn, including legacy unmarked turns."""
+    if any(e.get("type") == "task_start" and e.get("data", {}).get("task_id") == task_id for e in events):
+        active = False
+        selected = []
+        for event in events:
+            if event.get("type") == "task_start":
+                active = event.get("data", {}).get("task_id") == task_id
+            if active:
+                selected.append(event)
+                if event.get("type") == "task_end":
+                    active = False
+        return selected
+    if started_at is None:
+        return []
+    return [
+        event for event in events
+        if started_at <= event.get("ts", "") and (finished_at is None or event.get("ts", "") <= finished_at)
+    ]
+
+
+def task_progress(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Report observed activity without inferring whether the work is useful."""
+    last_tool: dict[str, Any] | None = None
+    last_edit_at: str | None = None
+    last_command_at: str | None = None
+    for event in events:
+        data = event.get("data") or {}
+        if event.get("type") == "tool_call":
+            kind = str(data.get("kind") or "unknown")
+            last_tool = {"kind": kind, "status": data.get("status"), "at": event.get("ts")}
+            if kind in {"edit", "write", "create", "delete", "move"}:
+                last_edit_at = event.get("ts")
+            elif kind == "execute":
+                last_command_at = event.get("ts")
+        elif event.get("type") == "tool_call_update" and last_tool is not None:
+            if data.get("tool_call_id") == last_tool.get("id"):
+                last_tool["status"] = data.get("status")
+        if event.get("type") == "tool_call" and last_tool is not None:
+            last_tool["id"] = data.get("tool_call_id")
+    if last_tool is not None:
+        last_tool.pop("id", None)
+    return {"last_tool": last_tool, "last_edit_at": last_edit_at, "last_command_at": last_command_at}

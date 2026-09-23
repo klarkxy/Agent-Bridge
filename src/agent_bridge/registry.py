@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import os
 import time
 import uuid
 from datetime import datetime
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Literal
 
@@ -52,6 +54,7 @@ from agent_bridge.processes import count_sibling_servers, owner_alive, process_c
 from agent_bridge.quota import QuotaCache, fetch_quota, looks_like_quota_error, provider_table, unknown_quota
 from agent_bridge.transcript import (
     append_event,
+    events_for_task,
     flush_pending,
     flush_session,
     forget_worker_activity,
@@ -60,10 +63,11 @@ from agent_bridge.transcript import (
     read_events,
     read_events_tail,
     recent_activity,
+    task_progress,
     worker_silence_sec,
 )
 from agent_bridge.worker_env import build_worker_env, describe_env, install_host_env, is_worker_context
-from agent_bridge.workspace import merge_files_changed, snapshot_workspace
+from agent_bridge.workspace import classify_files_changed, normalize_changed_paths, snapshot_workspace
 
 log = logging.getLogger(__name__)
 
@@ -99,6 +103,29 @@ STALL_CANCEL_GRACE_SEC = 15
 STATE_WRITE_ATTEMPTS = 5
 STATE_WRITE_RETRY_BASE_SEC = 0.05
 STATE_LOCK_TIMEOUT_SEC = 5.0
+
+
+def runtime_identity() -> dict[str, Any]:
+    """Identify loaded code even when the package version stays at 0.1.0."""
+    package = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for path in sorted(package.rglob("*.py")):
+        digest.update(path.relative_to(package).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    try:
+        package_version = version("agent-bridge")
+    except PackageNotFoundError:
+        package_version = None
+    return {
+        "package_version": package_version,
+        "source_sha256": digest.hexdigest(),
+        "package_path": str(package),
+        "process_started_at": datetime.fromtimestamp(
+            psutil.Process(os.getpid()).create_time()
+        ).astimezone().isoformat(),
+    }
 
 
 def _new_id(prefix: str) -> str:
@@ -161,6 +188,7 @@ class Registry:
         self._pending_state: dict[str, list[dict]] | None = None
         self._flush_task: asyncio.Task[None] | None = None
         self._state_error: Exception | None = None
+        self._runtime_identity = runtime_identity()
 
     @classmethod
     def create(
@@ -486,14 +514,14 @@ class Registry:
             warnings = status.setdefault("warnings", [])
             warnings.append(
                 f"{siblings} other agent-bridge server instance(s) running on this machine "
-                "(each coordinator host holds its own; abandoned ones self-exit after "
-                "server.idle_exit_sec)"
+                "(each coordinator host holds its own; close an unused host to end its Bridge)"
             )
         return status
 
     def coordinator_status(self) -> dict:
         cfg = self.config.coordinator
         return {
+            "runtime": self._runtime_identity,
             "mode": cfg.mode,
             "hint": COORDINATOR_MODE_HINTS.get(cfg.mode, COORDINATOR_MODE_HINTS["auto"]),
             "instructions": cfg.instructions or None,
@@ -688,9 +716,18 @@ class Registry:
         self.save()
         watch = None
         before: dict[str, tuple[int, int]] | None = None
+        reported_paths: list[str] = []
         try:
+            try:
+                append_event(session.session_id, "task_start", {"task_id": task_id}, self.home)
+            except OSError:
+                log.exception("could not record task start for %s", task_id)
             mark_worker_activity(session.session_id, self.home)
-            before = await asyncio.to_thread(snapshot_workspace, task.cwd)
+            try:
+                before = await asyncio.to_thread(snapshot_workspace, task.cwd)
+            except OSError as exc:
+                task.warnings.append(f"workspace snapshot unavailable: {type(exc).__name__}: {exc}")
+                log.warning("workspace snapshot unavailable for task %s: %s", task_id, exc)
             limit = self.config.get(session.agent).stall_timeout_sec
             watch = (
                 asyncio.create_task(
@@ -704,7 +741,8 @@ class Registry:
             if result.native_session_id:
                 session.native_session_id = result.native_session_id
             task.result_chars = len(result.text)
-            task.warnings = list(result.warnings)
+            task.warnings.extend(result.warnings)
+            reported_paths = normalize_changed_paths(task.cwd, result.files_changed)
             try:
                 atomic_write_text(result_path(task.task_id, self.home), result.text)
                 task.result_text = _tail(result.text)
@@ -714,10 +752,17 @@ class Registry:
                     f"full result persistence failed: {type(exc).__name__}: {exc}"
                 )
                 log.exception("could not persist full result for task %s", task.task_id)
-            full_changed = await asyncio.to_thread(
-                merge_files_changed, task.cwd, result.files_changed, before
-            )
-            self._set_files_changed(task, full_changed)
+            if before is not None:
+                try:
+                    full_changed, provenance = await asyncio.to_thread(
+                        classify_files_changed, task.cwd, result.files_changed, before
+                    )
+                    self._set_files_changed(task, full_changed, provenance)
+                except OSError as exc:
+                    task.warnings.append(f"workspace change collection unavailable: {type(exc).__name__}: {exc}")
+                    log.warning("workspace change collection unavailable for task %s: %s", task_id, exc)
+            if task.files_changed_state == FilesChangedState.pending:
+                self._set_files_changed_unavailable(task, reported_paths)
             task.usage = result.usage
             if session.agent == "grok":
                 observed = await asyncio.to_thread(observe_grok_session, session.cwd, session.native_session_id)
@@ -745,8 +790,10 @@ class Registry:
                 if result.error:
                     task.status = TaskStatus.failed
                     task.error = result.error
+                    task.error_details = {"stage": "prompt", "category": "worker_error", "prompt_sent": True}
                 elif result.stop_reason == "cancelled":
                     task.status = TaskStatus.cancelled
+                    task.cancel_reason = task.cancel_reason or "worker_cancelled"
                 else:
                     task.status = TaskStatus.completed
             session.turns += 1
@@ -754,12 +801,14 @@ class Registry:
             if task.status not in TERMINAL_STATUSES:
                 task.status = TaskStatus.cancelled
                 task.stop_reason = "cancelled"
+                task.cancel_reason = task.cancel_reason or "shutdown"
         except Exception as exc:
             log.exception("task %s failed", task_id)
             if task.status not in TERMINAL_STATUSES:
                 task.status = TaskStatus.failed
                 task.error = str(exc)
                 task.stop_reason = "error"
+                task.error_details = self._error_details(exc)
         finally:
             if watch is not None:
                 watch.cancel()
@@ -767,15 +816,15 @@ class Registry:
                     await watch
             if task.files_changed_state == FilesChangedState.pending:
                 if before is None:
-                    task.files_changed_state = FilesChangedState.unavailable
+                    self._set_files_changed_unavailable(task, reported_paths)
                 else:
                     try:
-                        full_changed = await asyncio.to_thread(
-                            merge_files_changed, task.cwd, [], before
+                        full_changed, provenance = await asyncio.to_thread(
+                            classify_files_changed, task.cwd, [], before
                         )
-                        self._set_files_changed(task, full_changed)
+                        self._set_files_changed(task, full_changed, provenance)
                     except Exception as exc:
-                        task.files_changed_state = FilesChangedState.unavailable
+                        self._set_files_changed_unavailable(task, reported_paths)
                         task.warnings.append(
                             f"final files_changed collection failed: {type(exc).__name__}: {exc}"
                         )
@@ -795,6 +844,7 @@ class Registry:
             if session.proc_state != ProcState.dead:
                 session.proc_state = ProcState.ready if adapter.resident else ProcState.idle_unloaded
             try:
+                append_event(session.session_id, "task_end", {"task_id": task_id, "status": task.status.value}, self.home)
                 flush_session(session.session_id, self.home)
             except OSError:
                 log.exception("could not flush transcript for task %s", task.task_id)
@@ -817,11 +867,32 @@ class Registry:
             self._schedule_idle(session.session_id)
 
     @staticmethod
-    def _set_files_changed(task: Task, paths: list[str]) -> None:
+    def _set_files_changed(task: Task, paths: list[str], provenance: dict[str, str] | None = None) -> None:
         task.files_changed_total = len(paths)
         task.files_changed = paths[:FILES_CHANGED_MAX]
         task.files_changed_truncated = len(paths) > FILES_CHANGED_MAX
         task.files_changed_state = FilesChangedState.collected
+        task.files_changed_provenance = {
+            path: (provenance or {}).get(path, "workspace_observed") for path in task.files_changed
+        }
+
+    @staticmethod
+    def _set_files_changed_unavailable(task: Task, reported_paths: list[str]) -> None:
+        task.files_changed_total = len(reported_paths)
+        task.files_changed = reported_paths[:FILES_CHANGED_MAX]
+        task.files_changed_truncated = len(reported_paths) > FILES_CHANGED_MAX
+        task.files_changed_provenance = {path: "worker_reported" for path in task.files_changed}
+        task.files_changed_state = FilesChangedState.unavailable
+
+    @staticmethod
+    def _error_details(exc: Exception) -> dict[str, Any]:
+        return {
+            "stage": getattr(exc, "stage", "unknown"),
+            "category": getattr(exc, "category", type(exc).__name__),
+            "worker_exit_code": getattr(exc, "worker_exit_code", None),
+            "stderr_summary": getattr(exc, "stderr_summary", None),
+            "prompt_sent": getattr(exc, "prompt_sent", None),
+        }
 
     async def _stall_watch(
         self,
@@ -1004,9 +1075,9 @@ class Registry:
             )
         if task.agent == "cursor":
             hint += (
-                " Cursor observed_model is the requested ID after Cursor confirmed "
-                "its mapped ACP options; observed_effort is Cursor's confirmed thought "
-                "level. Neither is a live sampler."
+                " Cursor observed_model comes from its confirmed ACP selection, "
+                "including the advertised default when no model was requested. "
+                "It is not a live sampler."
             )
         if task.agent == "devin":
             hint += (
@@ -1029,6 +1100,16 @@ class Registry:
 
     def _task_snapshot(self, task: Task, include_result: bool = False) -> dict:
         events = read_events_tail(task.session_id, self.home)
+        scoped_events = events_for_task(events, task.task_id, task.started_at, task.finished_at)
+        progress = task_progress(scoped_events)
+        progress["history_complete"] = (
+            task.started_at is None
+            or any(
+                event.get("type") == "task_start"
+                and event.get("data", {}).get("task_id") == task.task_id
+                for event in events
+            )
+        )
         payload: dict[str, Any] = {
             "task_id": task.task_id,
             "session_id": task.session_id,
@@ -1036,11 +1117,14 @@ class Registry:
             "status": task.status.value,
             "stop_reason": task.stop_reason,
             "error": task.error,
+            "error_details": task.error_details,
+            "cancel_reason": task.cancel_reason,
             "warnings": task.warnings,
             "files_changed": task.files_changed,
             "files_changed_total": task.files_changed_total,
             "files_changed_truncated": task.files_changed_truncated,
             "files_changed_state": task.files_changed_state.value,
+            "files_changed_provenance": task.files_changed_provenance,
             "model": task.model,
             "effort": task.effort,
             "request_id": task.request_id,
@@ -1054,7 +1138,10 @@ class Registry:
             "created_at": task.created_at,
             "started_at": task.started_at,
             "finished_at": task.finished_at,
-            "recent_activity": recent_activity(events),
+            "recent_activity": recent_activity(
+                [event for event in scoped_events if event.get("type") not in {"thought_chunk", "raw"}]
+            ),
+            "progress": progress,
         }
         if task.started_at:
             start = datetime.fromisoformat(task.started_at)
@@ -1140,18 +1227,31 @@ class Registry:
         )
         return payload
 
-    def get_transcript(self, session_id: str, offset: int = 0, limit: int = 50, kinds: list[str] | None = None) -> dict:
+    def get_transcript(
+        self, session_id: str, offset: int = 0, limit: int = 50,
+        kinds: list[str] | None = None, task_id: str | None = None,
+    ) -> dict:
         if session_id not in self.sessions and not transcript_path(session_id, self.home).is_file():
             raise KeyError(f"unknown session {session_id}")
         events = read_events(session_id, self.home)
+        if task_id is not None:
+            task = self._require_task(task_id)
+            if task.session_id != session_id:
+                raise ValueError("task_id does not belong to session_id")
+            events = events_for_task(events, task_id, task.started_at, task.finished_at)
         return page_events(events, offset=offset, limit=limit, kinds=kinds)
 
-    async def cancel_task(self, task_id: str) -> dict:
+    async def cancel_task(self, task_id: str, reason: str | None = None) -> dict:
         if not self.dispatch_enabled:
             raise RuntimeError(NESTED_CANCEL_ERROR)
+        if reason is not None and reason not in {
+            "user_request", "coordinator_takeover", "timeout", "session_end", "shutdown", "other"
+        }:
+            raise ValueError("reason must be user_request, coordinator_takeover, timeout, session_end, shutdown, or other")
         task = self._require_task(task_id)
         if task.status in TERMINAL_STATUSES:
             return self._task_snapshot(task)
+        task.cancel_reason = reason or "unspecified"
         session = self.sessions[task.session_id]
         adapter = self._adapters.get(session.session_id)
         if adapter is not None:
@@ -1212,7 +1312,7 @@ class Registry:
             raise KeyError(f"unknown session {session_id}")
         busy = self._busy_task(session_id)
         if busy is not None:
-            await self.cancel_task(busy.task_id)
+            await self.cancel_task(busy.task_id, reason="session_end")
         adapter = self._adapters.pop(session_id, None)
         if adapter is not None:
             await adapter.shutdown(session)

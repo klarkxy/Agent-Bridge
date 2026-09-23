@@ -200,23 +200,24 @@ async def get_transcript(
     offset: int = 0,
     limit: int = 50,
     kinds: str | None = None,
+    task_id: str | None = None,
 ) -> dict[str, Any]:
-    """Paged session transcript. kinds is an optional comma-separated event type list."""
+    """Paged session transcript. Optional task_id selects one turn; kinds is a comma-separated event type list."""
     try:
         kind_list = [item.strip() for item in kinds.split(",") if item.strip()] if kinds else None
         return {
             "ok": True,
-            **_registry(ctx).get_transcript(session_id, offset=offset, limit=limit, kinds=kind_list),
+            **_registry(ctx).get_transcript(session_id, offset=offset, limit=limit, kinds=kind_list, task_id=task_id),
         }
     except Exception as exc:
         return _error(exc)
 
 
 @mcp.tool()
-async def cancel_task(ctx: Context, task_id: str) -> dict[str, Any]:
-    """Cancel an in-flight worker turn. ACP sessions are cancelled; agy processes are killed. Rejected when coordinator.dispatch_enabled is false."""
+async def cancel_task(ctx: Context, task_id: str, reason: str | None = None) -> dict[str, Any]:
+    """Cancel a worker turn. Optional reason: user_request, coordinator_takeover, timeout, session_end, shutdown, other. Rejected when coordinator.dispatch_enabled is false."""
     try:
-        return {"ok": True, **await _registry(ctx).cancel_task(task_id)}
+        return {"ok": True, **await _registry(ctx).cancel_task(task_id, reason=reason)}
     except Exception as exc:
         return _error(exc)
 

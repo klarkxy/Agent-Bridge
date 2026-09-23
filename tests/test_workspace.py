@@ -1,13 +1,39 @@
 import os
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 from agent_bridge.workspace import (
     _root_prefix_len,
+    classify_files_changed,
     collect_update_paths,
     merge_files_changed,
     normalize_changed_paths,
     snapshot_workspace,
 )
+
+
+def test_shared_workspace_changes_keep_evidence_source(tmp_path: Path):
+    before = snapshot_workspace(tmp_path)
+    (tmp_path / "worker.txt").write_text("own", encoding="utf-8")
+    (tmp_path / "other.txt").write_text("unrelated", encoding="utf-8")
+    paths, sources = classify_files_changed(tmp_path, ["worker.txt", "reported-only.txt"], before)
+    assert paths == ["other.txt", "reported-only.txt", "worker.txt"]
+    assert sources == {
+        "other.txt": "workspace_observed",
+        "reported-only.txt": "worker_reported",
+        "worker.txt": "both",
+    }
+
+
+def test_snapshot_permission_error_is_not_an_empty_workspace(tmp_path: Path):
+    (tmp_path / "existing.txt").write_text("keep", encoding="utf-8")
+    with (
+        patch("agent_bridge.workspace.os.scandir", side_effect=PermissionError("blocked")),
+        pytest.raises(PermissionError, match="blocked"),
+    ):
+        snapshot_workspace(tmp_path)
 
 
 def test_snapshot_sees_new_file_and_ignores_sessions(tmp_path: Path):

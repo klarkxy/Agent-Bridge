@@ -112,7 +112,9 @@ class EnvConfig(BaseModel):
 class ServerConfig(BaseModel):
     """Process-level server behavior (idle self-exit for abandoned MCP instances)."""
 
-    idle_exit_sec: int = 7200
+    # A connected host can go hours without a tool call during a long task.
+    # Stdio EOF already ends a normally disconnected server.
+    idle_exit_sec: int = 0
 
 
 class QuotaConfig(BaseModel):

@@ -62,7 +62,7 @@ npm install -g @deepseek-ai/dsh-acp-demo
 .\.venv\Scripts\python.exe scripts\install_dsh_acp.py
 ```
 
-The helper writes `$AGENT_BRIDGE_HOME/dsh-acp` (default `~/.agent-bridge/dsh-acp`) and installs the ACP peers the cordis file imports. Bridge copies that cordis file next to the chosen `node_modules` so ESM can resolve plugins. An unbuilt checkout `src/bin.ts` is ignored unless `tsx` is installed. DSH persistence is `$AGENT_BRIDGE_HOME/dsh-sessions/<session_id>` so a user project does not get `./.sessions`. `get_result.files_changed` is a turn-scoped workspace diff, not only ACP tool_call events (DSH often sends none). It is capped at 200 paths; `files_changed_total` / `files_changed_truncated` tell you when to fall back to `git status`. `files_changed_state` is `pending` until that diff runs, `collected` when an empty list is a confirmed zero, and `unavailable` if collection could not run.
+The helper writes `$AGENT_BRIDGE_HOME/dsh-acp` (default `~/.agent-bridge/dsh-acp`) and installs the ACP peers the cordis file imports. Bridge copies that cordis file next to the chosen `node_modules` so ESM can resolve plugins. An unbuilt checkout `src/bin.ts` is ignored unless `tsx` is installed. DSH persistence is `$AGENT_BRIDGE_HOME/dsh-sessions/<session_id>` so a user project does not get `./.sessions`. `get_result.files_changed` combines the worker's reported paths with a turn-scoped workspace diff (DSH often sends no tool_call updates). It is capped at 200 paths; `files_changed_total` / `files_changed_truncated` tell you when to fall back to `git status`. `files_changed_state` is `pending` until that diff runs, `collected` when an empty list is a confirmed zero, and `unavailable` if collection could not run. `files_changed_provenance` labels each listed path as `worker_reported`, `workspace_observed`, or `both`; a workspace observation in a shared cwd may belong to another writer.
 
 Restart Codex after editing `config.toml`.
 
@@ -319,6 +319,8 @@ Already on a clone and want the tool install instead: `uv tool install git+https
 
 Running Codex, Cursor, Kimi Code, ZCode, Grok Build, and Claude Code coordinators at the same time is supported: each host spawns its own Bridge process, and `list_agents` merely counts independent siblings (not a nested Bridge inside a worker this instance started). A `uv tool` install is shared and does not sync on spawn.
 
+`list_agents.coordinator.runtime` reports the loaded package path, package version, source SHA-256 fingerprint, and process start time. The version may stay `0.1.0` across local builds; compare the fingerprint and path after updating the installed tool and starting a fresh MCP process. Task failures keep the existing `error` text and add `error_details` with stage, category, worker exit code, a safe stderr summary when available, and whether the prompt may have been sent. Do not automatically replay a turn after `prompt_sent=true`. `check_task` and `wait_task` include last tool activity, editing and command timestamps. `progress.history_complete=false` means an earlier tool may have scrolled out of the bounded status view; `get_transcript` can select the full turn with `task_id`. `cancel_task` accepts an optional reason from `user_request`, `coordinator_takeover`, `timeout`, `session_end`, `shutdown`, or `other`.
+
 What must not run twice is the **installer** of a git checkout. A plain `uv run` syncs the project before executing, and that sync rewrites `.venv\Scripts\agent-bridge.exe` — on Windows a file every running instance holds open. The second host's spawn then dies before the MCP handshake with:
 
 ```text
@@ -331,7 +333,7 @@ Instances share the `~/.agent-bridge` state directory but not sessions: every se
 
 ## Server lifecycle
 
-Abandoned server instances self-exit: after `server.idle_exit_sec` (default 7200 s) with no MCP requests and no queued or running tasks, the process shuts its workers down and exits. Configure in `[server]` (repo `agents.toml` or `%USERPROFILE%\.agent-bridge\agents.toml`); `idle_exit_sec = 0` disables it. `list_agents` also warns when other Bridge instances are running on this machine — one per coordinator host is normal, a pile-up means a host keeps abandoning spawns.
+The server stays connected through long pauses by default (`server.idle_exit_sec = 0`) and shuts down when its host closes the stdio connection. A positive `idle_exit_sec` opts into self-exit after that many seconds without MCP requests or queued/running tasks. Configure it in `[server]` (repo `agents.toml` or `%USERPROFILE%\.agent-bridge\agents.toml`). `list_agents` warns when other Bridge instances are running; one per coordinator host is normal. Close unused hosts if instances accumulate.
 
 ## Remaining quota in `list_agents`
 

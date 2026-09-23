@@ -260,6 +260,36 @@ async def test_cursor_model_is_discovered_once_pinned_switched_and_reported(tmp_
 
 
 @pytest.mark.asyncio
+async def test_cursor_default_model_is_observed_without_selection(tmp_path):
+    marker = tmp_path / "model-list-calls.txt"
+    adapter = AcpAdapter(
+        AgentConfig(
+            name="cursor",
+            protocol="acp",
+            command=[sys.executable, str(CURSOR_AGENT), "acp"],
+            env={"CURSOR_AGENT_LIST_MARKER": str(marker)},
+        ),
+        tmp_path / "bridge-home",
+    )
+    session = Session(session_id="sess_cursor_default", agent="cursor", cwd=str(tmp_path))
+    task = Task(
+        task_id="task_cursor_default",
+        session_id=session.session_id,
+        agent="cursor",
+        message="default",
+        cwd=session.cwd,
+    )
+    try:
+        result = await adapter.run_turn(session, task)
+        assert adapter._live[session.session_id].applied_model == "model-a"
+    finally:
+        await adapter.shutdown(session)
+    assert result.observed_model == "model-a"
+    assert session.model is None
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
 async def test_cursor_unavailable_model_fails_before_acp_start(tmp_path):
     adapter = AcpAdapter(
         AgentConfig(

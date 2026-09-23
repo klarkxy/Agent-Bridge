@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from agent_bridge import transcript
+from agent_bridge.adapters.acp import AcpStageError
 from agent_bridge.adapters.fake import FakeAdapter
 from agent_bridge.models import (
     TERMINAL_STATUSES,
@@ -31,8 +33,120 @@ from agent_bridge.registry import (
     NESTED_END_SESSION_ERROR,
     NESTED_PREFERENCES_ERROR,
     Registry,
+    runtime_identity,
 )
 from agent_bridge.transcript import append_event, read_events
+from agent_bridge.workspace import snapshot_workspace
+
+
+def test_runtime_identity_exposes_loaded_source_fingerprint(bridge_home):
+    identity = runtime_identity()
+    assert len(identity["source_sha256"]) == 64
+    assert identity["package_path"]
+    assert identity["process_started_at"]
+    assert Registry.create(bridge_home).coordinator_status()["runtime"] == identity
+
+
+@pytest.mark.asyncio
+async def test_transcript_and_progress_are_scoped_to_task(bridge_home, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    try:
+        first = await registry.dispatch_task("fake", "first turn", cwd=str(work.resolve()))
+        await registry.wait_task(first["task_id"], timeout_sec=5)
+        second = await registry.dispatch_task(
+            "fake", "second turn", cwd=str(work.resolve()), session_id=first["session_id"]
+        )
+        await registry.wait_task(second["task_id"], timeout_sec=5)
+        first_events = registry.get_transcript(first["session_id"], task_id=first["task_id"])["events"]
+        second_events = registry.get_transcript(second["session_id"], task_id=second["task_id"])["events"]
+        assert any(e["type"] == "task_start" and e["data"]["task_id"] == first["task_id"] for e in first_events)
+        assert all(e.get("data", {}).get("text") != "second turn" for e in first_events)
+        assert any(e["type"] == "task_start" and e["data"]["task_id"] == second["task_id"] for e in second_events)
+        first_status = registry.check_task(first["task_id"])
+        assert all("second turn" not in item for item in first_status["recent_activity"])
+    finally:
+        await registry.stop()
+
+
+@pytest.mark.asyncio
+async def test_acp_failure_details_reach_task_result(bridge_home, tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    work.mkdir()
+
+    async def fail_prompt(self, session, task):
+        raise AcpStageError(
+            "connection closed", stage="prompt", category="worker_exit",
+            worker_exit_code=7, stderr_summary="authentication required", prompt_sent=True,
+        )
+
+    monkeypatch.setattr(FakeAdapter, "run_turn", fail_prompt)
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    try:
+        dispatched = await registry.dispatch_task("fake", "run", cwd=str(work.resolve()))
+        result = await registry.wait_task(dispatched["task_id"], timeout_sec=5)
+        assert result["status"] == "failed"
+        assert result["error"] == "connection closed"
+        assert result["error_details"] == {
+            "stage": "prompt", "category": "worker_exit", "worker_exit_code": 7,
+            "stderr_summary": "authentication required", "prompt_sent": True,
+        }
+        assert registry.get_result(dispatched["task_id"])["error_details"] == result["error_details"]
+    finally:
+        await registry.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_event", ["task_start", "task_end"])
+async def test_transcript_write_failure_does_not_strand_task(
+    bridge_home, tmp_path, monkeypatch, failed_event
+):
+    work = tmp_path / "work"
+    work.mkdir()
+    original = transcript._append_batch
+    failed = False
+
+    def fail_one_boundary(path, text):
+        nonlocal failed
+        if not failed and f'"type":"{failed_event}"' in text:
+            failed = True
+            raise OSError("synthetic transcript write failure")
+        return original(path, text)
+
+    monkeypatch.setattr(transcript, "_append_batch", fail_one_boundary)
+    if failed_event == "task_start":
+        monkeypatch.setattr(transcript, "BUFFER_BYTE_LIMIT", 1)
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    try:
+        dispatched = await registry.dispatch_task("fake", "complete", cwd=str(work.resolve()))
+        result = await registry.wait_task(dispatched["task_id"], timeout_sec=5)
+        assert failed
+        assert result["status"] == "completed"
+        assert registry._done[dispatched["task_id"]].is_set()
+        assert dispatched["task_id"] not in registry._bg
+    finally:
+        await registry.stop()
+
+
+def test_long_turn_progress_marks_bounded_history(bridge_home, tmp_path):
+    registry = Registry.create(bridge_home)
+    session = Session(session_id="sess_long", agent="fake", cwd=str(tmp_path))
+    task = Task(task_id="task_long", session_id=session.session_id, agent="fake",
+                cwd=session.cwd, message="long", status=TaskStatus.running, started_at=iso())
+    registry.sessions[session.session_id] = session
+    registry.tasks[task.task_id] = task
+    append_event(session.session_id, "task_start", {"task_id": task.task_id}, bridge_home)
+    append_event(session.session_id, "tool_call", {"kind": "edit", "status": "completed"}, bridge_home)
+    append_event(session.session_id, "message_chunk", {"text": "x" * 20_000}, bridge_home)
+    status = registry.check_task(task.task_id)
+    assert status["progress"]["history_complete"] is False
+    assert status["progress"]["last_edit_at"] is None
+    transcript_page = registry.get_transcript(session.session_id, task_id=task.task_id)
+    assert any(event["type"] == "tool_call" for event in transcript_page["events"])
 
 
 @pytest.mark.asyncio
@@ -976,6 +1090,7 @@ async def test_idle_exit_due_predicate(bridge_home, tmp_path):
     work = tmp_path / "work"
     work.mkdir()
     registry = Registry.create(bridge_home)
+    registry.config.server.idle_exit_sec = 30
     await registry.start()
     try:
         assert registry.idle_exit_due() is False
@@ -1263,7 +1378,10 @@ async def test_workspace_snapshot_runs_off_loop(bridge_home, tmp_path, monkeypat
 @pytest.mark.asyncio
 async def test_files_changed_is_capped(bridge_home, tmp_path, monkeypatch):
     paths = [f"gen/{i:04d}.txt" for i in range(500)]
-    monkeypatch.setattr("agent_bridge.registry.merge_files_changed", lambda *args, **kwargs: list(paths))
+    monkeypatch.setattr(
+        "agent_bridge.registry.classify_files_changed",
+        lambda *args, **kwargs: (list(paths), {path: "worker_reported" for path in paths}),
+    )
     work = tmp_path / "work"
     work.mkdir()
     registry = Registry.create(bridge_home)
@@ -1275,6 +1393,7 @@ async def test_files_changed_is_capped(bridge_home, tmp_path, monkeypatch):
         assert waited["files_changed"] == paths[:200]
         assert waited["files_changed_total"] == 500
         assert waited["files_changed_truncated"] is True
+        assert len(waited["files_changed_provenance"]) == 200
         result = registry.get_result(dispatched["task_id"])
         assert "first 200 of 500" in result["hint"]
         checked = registry.check_task(dispatched["task_id"])
@@ -1332,6 +1451,7 @@ async def test_running_files_changed_is_pending_until_collection(
         assert finished["files_changed"] == ["created.txt"]
         assert finished["files_changed_total"] == 1
         assert finished["files_changed_state"] == "collected"
+        assert finished["files_changed_provenance"] == {"created.txt": "workspace_observed"}
     finally:
         release.set()
         await registry.stop()
@@ -1355,6 +1475,47 @@ async def test_failed_turn_collects_workspace_changes(bridge_home, tmp_path, mon
         assert finished["status"] == "failed"
         assert finished["files_changed"] == ["partial.txt"]
         assert finished["files_changed_state"] == "collected"
+        assert finished["error_details"] == {
+            "stage": "unknown", "category": "RuntimeError", "worker_exit_code": None,
+            "stderr_summary": None, "prompt_sent": None,
+        }
+    finally:
+        await registry.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_scan", [1, 2])
+async def test_incomplete_workspace_scan_preserves_worker_result(
+    bridge_home, tmp_path, monkeypatch, failed_scan
+):
+    work = tmp_path / "work"
+    work.mkdir()
+    scans = 0
+
+    def flaky_snapshot(cwd):
+        nonlocal scans
+        scans += 1
+        if scans == failed_scan:
+            raise PermissionError("synthetic scan failure")
+        return snapshot_workspace(cwd)
+
+    async def write_then_ok(self, session, task):
+        (Path(task.cwd) / "partial.txt").write_text("done", encoding="utf-8")
+        return TurnResult(text="done", files_changed=["partial.txt"])
+
+    monkeypatch.setattr("agent_bridge.registry.snapshot_workspace", flaky_snapshot)
+    monkeypatch.setattr("agent_bridge.workspace.snapshot_workspace", flaky_snapshot)
+    monkeypatch.setattr(FakeAdapter, "run_turn", write_then_ok)
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    try:
+        dispatched = await registry.dispatch_task("fake", "write", cwd=str(work.resolve()))
+        result = await registry.wait_task(dispatched["task_id"], timeout_sec=5)
+        assert result["status"] == "completed"
+        assert result["result_text"] == "done"
+        assert result["files_changed_state"] == "unavailable"
+        assert result["files_changed_provenance"] == {"partial.txt": "worker_reported"}
+        assert any("snapshot unavailable" in warning or "collection unavailable" in warning for warning in result["warnings"])
     finally:
         await registry.stop()
 
@@ -1377,8 +1538,9 @@ async def test_cancelled_turn_collects_workspace_changes(bridge_home, tmp_path, 
     try:
         dispatched = await registry.dispatch_task("fake", "cancel", cwd=str(work.resolve()))
         await asyncio.wait_for(wrote.wait(), timeout=5)
-        cancelled = await registry.cancel_task(dispatched["task_id"])
+        cancelled = await registry.cancel_task(dispatched["task_id"], reason="coordinator_takeover")
         assert cancelled["status"] == "cancelled"
+        assert cancelled["cancel_reason"] == "coordinator_takeover"
         assert cancelled["files_changed"] == ["cancelled.txt"]
         assert cancelled["files_changed_state"] == "collected"
     finally:

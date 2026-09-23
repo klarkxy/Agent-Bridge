@@ -53,27 +53,26 @@ def snapshot_workspace(cwd: str | Path) -> dict[str, tuple[int, int]]:
     """
     root = Path(cwd)
     if not root.is_dir():
-        return {}
+        raise FileNotFoundError(f"workspace is unavailable: {root}")
     found: dict[str, tuple[int, int]] = {}
     stack = [str(root)]
     prefix_len = _root_prefix_len(str(root))
     while stack:
         current = stack.pop()
-        try:
-            with os.scandir(current) as it:
-                for entry in it:
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
-                            if entry.name not in SKIP_DIR_NAMES:
-                                stack.append(entry.path)
-                        elif entry.is_file(follow_symlinks=False):
-                            st = entry.stat(follow_symlinks=False)
-                            rel = entry.path[prefix_len:].replace(os.sep, "/")
-                            found[rel] = (st.st_mtime_ns, st.st_size)
-                    except OSError:
-                        continue
-        except OSError:
-            continue
+        with os.scandir(current) as it:
+            for entry in it:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        if entry.name not in SKIP_DIR_NAMES:
+                            stack.append(entry.path)
+                    elif entry.is_file(follow_symlinks=False):
+                        st = entry.stat(follow_symlinks=False)
+                        rel = entry.path[prefix_len:].replace(os.sep, "/")
+                        found[rel] = (st.st_mtime_ns, st.st_size)
+                except FileNotFoundError:
+                    # A file disappearing during enumeration is absent in
+                    # the final snapshot. Other errors make it incomplete.
+                    continue
     return found
 
 
@@ -110,7 +109,27 @@ def merge_files_changed(
     reported: list[str],
     before: dict[str, tuple[int, int]],
 ) -> list[str]:
-    return normalize_changed_paths(cwd, [*reported, *changed_since(cwd, before)])
+    return classify_files_changed(cwd, reported, before)[0]
+
+
+def classify_files_changed(
+    cwd: str | Path,
+    reported: list[str],
+    before: dict[str, tuple[int, int]],
+) -> tuple[list[str], dict[str, str]]:
+    """Keep compatible union plus evidence for each path's source.
+
+    A workspace observation is not proof that this worker wrote the file.
+    """
+    from_worker = set(normalize_changed_paths(cwd, reported))
+    from_workspace = set(normalize_changed_paths(cwd, changed_since(cwd, before)))
+    paths = sorted(from_worker | from_workspace)
+    sources = {
+        path: ("both" if path in from_worker and path in from_workspace else
+               "worker_reported" if path in from_worker else "workspace_observed")
+        for path in paths
+    }
+    return paths, sources
 
 
 def _relative_to_cwd(raw: str, root: Path) -> str | None:

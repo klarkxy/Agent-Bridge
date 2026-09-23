@@ -78,8 +78,56 @@ def _tool_io_summary(value: Any) -> str | None:
     return text if len(text) <= _TOOL_IO_LIMIT else text[:_TOOL_IO_LIMIT] + "…"
 
 
-class RpcTimeoutError(RuntimeError):
-    pass
+_SAFE_STDERR_MESSAGES = (
+    (r"connection (?:was )?closed", "connection closed"),
+    (r"internal error", "internal error"),
+    (r"auth(?:entication)? required", "authentication required"),
+    (r"auth(?:entication)? failed", "authentication failed"),
+    (r"unauthorized|unauthorised", "unauthorized"),
+    (r"permission denied", "permission denied"),
+    (r"rate limit", "rate limited"),
+    (r"quota exceeded", "quota exceeded"),
+    (r"timed? out", "timed out"),
+    (r"model (?:not found|unavailable)", "model unavailable"),
+    (r"no such file or directory|command not found|not recognized", "command unavailable"),
+)
+
+
+def _safe_stderr_summary(stderr: str) -> str | None:
+    """Return only a fixed diagnostic phrase, never worker supplied text."""
+    for pattern, summary in _SAFE_STDERR_MESSAGES:
+        if re.search(pattern, stderr, flags=re.IGNORECASE):
+            return summary
+    return None
+
+
+class AcpStageError(RuntimeError):
+    """Private transport failure with safe structured context for the registry."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage: str,
+        category: str,
+        worker_exit_code: int | None = None,
+        stderr_summary: str | None = None,
+        prompt_sent: bool | None = False,
+    ) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.category = category
+        self.worker_exit_code = worker_exit_code
+        self.stderr_summary = stderr_summary
+        self.prompt_sent = prompt_sent
+
+
+class RpcTimeoutError(AcpStageError):
+    """Backward compatible timeout type used by existing ACP callers."""
+
+
+class AcpModelUnavailableError(AcpStageError, ValueError):
+    """Keep model validation compatible with callers expecting ValueError."""
 
 
 def grok_session_meta(
@@ -638,6 +686,43 @@ class AcpAdapter(Adapter):
             return apply_devin_env(env)
         return env
 
+    def _stage_error(
+        self,
+        exc: Exception,
+        stage: str,
+        session: Session | None = None,
+        *,
+        proc: asyncio.subprocess.Process | None = None,
+        stderr: str = "",
+        prompt_sent: bool | None = False,
+    ) -> AcpStageError:
+        if isinstance(exc, AcpStageError):
+            return exc
+        live = self._live.get(session.session_id) if session else None
+        proc = proc or (live.proc if live else None)
+        stderr = stderr or (live.stderr_tail if live else "")
+        if isinstance(exc, TimeoutError):
+            category = "timeout"
+        elif proc is not None and proc.returncode is not None:
+            category = "worker_exit"
+        elif stage == "process_start":
+            category = "process_start"
+        elif isinstance(exc, ValueError) and "model" in str(exc).lower():
+            category = "model_unavailable"
+        elif stage == "model_selection":
+            category = "selection_error"
+        else:
+            category = "protocol_error"
+        error_type = AcpModelUnavailableError if category == "model_unavailable" else AcpStageError
+        return error_type(
+            str(exc),
+            stage=stage,
+            category=category,
+            worker_exit_code=proc.returncode if proc else None,
+            stderr_summary=_safe_stderr_summary(stderr),
+            prompt_sent=prompt_sent,
+        )
+
     async def _drain_stderr(
         self,
         proc: asyncio.subprocess.Process,
@@ -669,18 +754,27 @@ class AcpAdapter(Adapter):
             return await asyncio.wait_for(coro, timeout=timeout)
         except TimeoutError:
             live = self._live.get(session.session_id)
+            stderr_summary = _safe_stderr_summary(live.stderr_tail) if live else None
+            worker_exit_code = live.proc.returncode if live and live.proc else None
             log.error(
-                "%s %s timed out after %ss for %s; killing worker stderr_tail=%r",
+                "%s %s timed out after %ss for %s; killing worker stderr_summary=%r",
                 self.agent.name,
                 what,
                 timeout,
                 session.session_id,
-                live.stderr_tail if live else "",
+                stderr_summary,
             )
             await self.shutdown(session)
             raise RpcTimeoutError(
-                f"{self.agent.name} {what} timed out after {int(timeout)}s"
+                f"{self.agent.name} {what} timed out after {int(timeout)}s",
+                stage="model_selection" if what.startswith("session/set") else what,
+                category="timeout",
+                worker_exit_code=worker_exit_code,
+                stderr_summary=stderr_summary,
             ) from None
+        except Exception as exc:
+            stage = "model_selection" if what.startswith("session/set") else what
+            raise self._stage_error(exc, stage, session) from exc
 
     async def _cursor_models(
         self,
@@ -690,14 +784,20 @@ class AcpAdapter(Adapter):
     ) -> dict[str, str]:
         if self._cursor_models_cache is not None:
             return self._cursor_models_cache
-        model_cmd = cursor_list_models_command(command)
-        proc = await asyncio.create_subprocess_exec(
-            *model_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-            cwd=cwd,
-        )
+        try:
+            model_cmd = cursor_list_models_command(command)
+        except Exception as exc:
+            raise self._stage_error(exc, "model_discovery") from exc
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *model_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                cwd=cwd,
+            )
+        except Exception as exc:
+            raise self._stage_error(exc, "model_discovery") from exc
         try:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=CURSOR_MODEL_LIST_TIMEOUT_SEC
@@ -706,68 +806,97 @@ class AcpAdapter(Adapter):
             await reap_subprocess(proc)
             raise
         except TimeoutError:
+            worker_exit_code = proc.returncode
             await reap_subprocess(proc)
-            raise RuntimeError(
+            raise AcpStageError(
                 "cursor model discovery timed out; run 'cursor-agent --list-models' "
-                "to check the current account"
+                "to check the current account",
+                stage="model_discovery",
+                category="timeout",
+                worker_exit_code=worker_exit_code,
             ) from None
+        except Exception as exc:
+            await reap_subprocess(proc)
+            raise self._stage_error(exc, "model_discovery", proc=proc) from exc
         if proc.returncode:
-            detail = stderr.decode("utf-8", errors="replace").strip()
-            suffix = f": {detail[-1000:]}" if detail else ""
-            raise RuntimeError(f"cursor model discovery failed{suffix}")
+            raise AcpStageError(
+                "cursor model discovery failed",
+                stage="model_discovery",
+                category="worker_exit",
+                worker_exit_code=proc.returncode,
+                stderr_summary=_safe_stderr_summary(stderr.decode("utf-8", errors="replace")),
+            )
         models = parse_cursor_models(stdout.decode("utf-8", errors="replace"))
         if not models:
-            raise RuntimeError(
+            raise AcpStageError(
                 "cursor model discovery returned no model IDs; run "
-                "'cursor-agent --list-models' to check the current account"
+                "'cursor-agent --list-models' to check the current account",
+                stage="model_discovery",
+                category="protocol_error",
             )
         self._cursor_models_cache = models
         return models
 
     async def _spawn(self, session: Session) -> _Live:
         await self.shutdown(session)
-        if self.agent.name == "dsh":
-            cmd = resolve_dsh_command(self.agent.command, self.agent.fallback_commands)
-        else:
-            cmd = resolve_command(self.agent.command, self.agent.fallback_commands)
-        env = self._env()
-        if self.agent.name == "dsh":
-            cmd, env = prepare_dsh_launch(
-                cmd,
-                env,
-                session_id=session.session_id,
-                model=session.model,
-                effort=session.effort,
-            )
-        elif self.agent.name == "grok":
-            cmd = with_grok_cli_selection(cmd, session.model, session.effort)
-        elif self.agent.name == "cursor" and session.model:
-            models = await self._cursor_models(
-                cmd,
-                env,
-                self.agent.cwd or session.cwd or None,
-            )
-            if session.model not in models:
-                raise ValueError(
-                    f"cursor model {session.model!r} is not available for the current account; "
-                    f"available model IDs: {', '.join(models)}"
+        try:
+            if self.agent.name == "dsh":
+                cmd = resolve_dsh_command(self.agent.command, self.agent.fallback_commands)
+            else:
+                cmd = resolve_command(self.agent.command, self.agent.fallback_commands)
+            env = self._env()
+            if self.agent.name == "dsh":
+                cmd, env = prepare_dsh_launch(
+                    cmd,
+                    env,
+                    session_id=session.session_id,
+                    model=session.model,
+                    effort=session.effort,
                 )
-            cmd = with_cursor_cli_model(cmd, session.model)
+            elif self.agent.name == "grok":
+                cmd = with_grok_cli_selection(cmd, session.model, session.effort)
+            elif self.agent.name == "cursor" and session.model:
+                models = await self._cursor_models(
+                    cmd,
+                    env,
+                    self.agent.cwd or session.cwd or None,
+                )
+                if session.model not in models:
+                    raise ValueError(
+                        f"cursor model {session.model!r} is not available for the current account; "
+                        f"available model IDs: {', '.join(models)}"
+                    )
+                cmd = with_cursor_cli_model(cmd, session.model)
+        except AcpStageError:
+            raise
+        except ValueError as exc:
+            raise self._stage_error(exc, "model_selection", session) from exc
+        except Exception as exc:
+            raise self._stage_error(exc, "process_start", session) from exc
         kwargs: dict[str, Any] = {}
         if sys.platform == "win32":
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-            cwd=self.agent.cwd or session.cwd or None,
-            limit=STDIO_LIMIT,
-            **kwargs,
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                cwd=self.agent.cwd or session.cwd or None,
+                limit=STDIO_LIMIT,
+                **kwargs,
+            )
+        except Exception as exc:
+            raise self._stage_error(exc, "process_start", session) from exc
         if proc.stdin is None or proc.stdout is None:
-            raise RuntimeError(f"{self.agent.name} did not expose stdio")
+            await reap_subprocess(proc)
+            raise AcpStageError(
+                f"{self.agent.name} did not expose stdio",
+                stage="process_start",
+                category="protocol_error",
+                worker_exit_code=proc.returncode,
+            )
         live = _Live()
         live.proc = proc
         live.client = _BridgeClient(session.session_id, self.home)
@@ -949,10 +1078,19 @@ class AcpAdapter(Adapter):
             raise
         except Exception as exc:
             _, offered = config_option_values(live.config_options, "model")
-            raise RuntimeError(
+            message = (
                 f"{self.agent.name} rejected model {session.model!r}; "
                 f"session advertises {offered or 'no models'}"
-            ) from exc
+            )
+            if isinstance(exc, AcpStageError):
+                raise AcpStageError(
+                    message,
+                    stage="model_selection",
+                    category=exc.category,
+                    worker_exit_code=exc.worker_exit_code,
+                    stderr_summary=exc.stderr_summary,
+                ) from exc
+            raise RuntimeError(message) from exc
         self._remember_applied_model(live, session.model)
 
     async def _sync_cursor_selection(self, live: _Live, session: Session) -> None:
@@ -1015,7 +1153,8 @@ class AcpAdapter(Adapter):
                     raise RuntimeError(
                         f"cursor confirmed {option_id}={current!r} after selecting {target!r}"
                     )
-        live.applied_model = session.model
+        current_model, _offered_models = config_option_values(live.config_options, "model")
+        live.applied_model = session.model or current_model
         applied_effort_id = next(
             (option_id for option_id in effort_ids if option_id in targets),
             effort_ids[0] if effort_ids else None,
@@ -1210,13 +1349,18 @@ class AcpAdapter(Adapter):
             live.applied_effort = session.effort
 
     async def _sync_selection(self, live: _Live, session: Session) -> None:
-        await self._sync_grok_model(live, session)
-        await self._sync_cursor_selection(live, session)
-        await self._sync_kimi_selection(live, session)
-        await self._sync_opencode_selection(live, session)
-        await self._sync_claude_selection(live, session)
-        await self._sync_devin_selection(live, session)
-        await self._sync_dsh_selection(live, session)
+        try:
+            await self._sync_grok_model(live, session)
+            await self._sync_cursor_selection(live, session)
+            await self._sync_kimi_selection(live, session)
+            await self._sync_opencode_selection(live, session)
+            await self._sync_claude_selection(live, session)
+            await self._sync_devin_selection(live, session)
+            await self._sync_dsh_selection(live, session)
+        except AcpStageError:
+            raise
+        except Exception as exc:
+            raise self._stage_error(exc, "model_selection", session) from exc
 
     async def _sync_claude_effort(self, live: _Live, session: Session) -> None:
         if not session.effort:
@@ -1382,11 +1526,16 @@ class AcpAdapter(Adapter):
                 f"model={task.model!r} effort={task.effort!r} were ignored"
             )
         append_event(session.session_id, "prompt_sent", {"text": task.message}, self.home)
-        prompt = live.conn.prompt(
-            session_id=session.native_session_id,
-            prompt=[text_block(task.message)],
-        )
-        live.prompt_task = asyncio.ensure_future(prompt)
+        try:
+            prompt = live.conn.prompt(
+                session_id=session.native_session_id,
+                prompt=[text_block(task.message)],
+            )
+            live.prompt_task = asyncio.ensure_future(prompt)
+        except Exception as exc:
+            # A synchronous failure may have occurred before or during the
+            # transport call; only the worker can establish delivery.
+            raise self._stage_error(exc, "prompt", session, prompt_sent=None) from exc
         try:
             response = await live.prompt_task
         except asyncio.CancelledError:
@@ -1399,15 +1548,15 @@ class AcpAdapter(Adapter):
                 observed_model=live.applied_model,
                 observed_effort=live.applied_effort,
             )
-        except Exception:
+        except Exception as exc:
             if live.stderr_tail:
                 log.warning(
-                    "%s prompt failed for %s stderr_tail=%r",
+                    "%s prompt failed for %s stderr_summary=%r",
                     self.agent.name,
                     session.session_id,
-                    live.stderr_tail,
+                    _safe_stderr_summary(live.stderr_tail),
                 )
-            raise
+            raise self._stage_error(exc, "prompt", session, prompt_sent=True) from exc
         finally:
             live.prompt_task = None
         stop = getattr(response, "stop_reason", None) or "end_turn"

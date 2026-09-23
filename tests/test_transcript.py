@@ -6,14 +6,35 @@ from agent_bridge import transcript
 from agent_bridge.paths import transcript_path
 from agent_bridge.transcript import (
     append_event,
+    events_for_task,
     flush_session,
     forget_worker_activity,
     mark_worker_activity,
     page_events,
     read_events,
     read_events_tail,
+    task_progress,
     worker_silence_sec,
 )
+
+
+def test_task_scoping_and_progress_omit_other_turns(bridge_home):
+    session = "sess_progress"
+    append_event(session, "task_start", {"task_id": "task_one"}, bridge_home)
+    append_event(session, "tool_call", {"tool_call_id": "a", "kind": "edit", "status": "in_progress"}, bridge_home)
+    append_event(session, "tool_call_update", {"tool_call_id": "a", "status": "completed"}, bridge_home)
+    append_event(session, "task_end", {"task_id": "task_one"}, bridge_home)
+    append_event(session, "task_start", {"task_id": "task_two"}, bridge_home)
+    append_event(session, "tool_call", {"tool_call_id": "b", "kind": "execute", "status": "in_progress"}, bridge_home)
+    events = read_events(session, bridge_home)
+    first = events_for_task(events, "task_one")
+    assert len(first) == 4
+    assert task_progress(first)["last_tool"]["status"] == "completed"
+    assert task_progress(first)["last_edit_at"] is not None
+    second = events_for_task(events, "task_two")
+    assert len(second) == 2
+    assert task_progress(second)["last_command_at"] is not None
+    assert task_progress(second)["last_edit_at"] is None
 
 
 def test_small_events_stay_buffered_but_are_readable(bridge_home):

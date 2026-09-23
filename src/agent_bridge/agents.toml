@@ -90,8 +90,9 @@ discover_proxy = true
 # no_proxy = "localhost,127.0.0.1,::1"
 
 [server]
-# Self-exit for abandoned MCP server instances whose host never closed stdin.
-idle_exit_sec = 7200
+# Keep a connected host alive through long pauses. Set a positive timeout only
+# when the host lifecycle cannot close its stdio connection on exit.
+idle_exit_sec = 0
 
 [coordinator]
 # How eagerly the coordinator should dispatch to workers.
