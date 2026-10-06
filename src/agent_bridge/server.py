@@ -37,7 +37,7 @@ async def lifespan(_server: MCPServer[Registry]) -> AsyncIterator[Registry]:
 INSTRUCTIONS = (
     "Agent Bridge executes already-defined external TaskNode leaves through local "
     "worker CLIs (Grok, Kimi Code, "
-    "Antigravity, DeepSeek Harness, OpenCode, Claude Code, Codex CLI, Devin CLI) and keeps their "
+    "Antigravity, DeepSeek Harness, OpenCode, Claude Code, Codex CLI, Devin CLI, Cursor, ZCode, MiniMax Code) and keeps their "
     "sessions resumable.\n"
     "Hard rules: workers are reached only through these tools — never drive the "
     "worker CLIs or GUIs directly. The top-level coordinator owns routing, Git, "
@@ -134,7 +134,7 @@ async def dispatch_task(
     workspace_mode: str | None = None,
     base_revision: str | None = None,
 ) -> dict[str, Any]:
-    """Start an external TaskNode turn. cwd is the absolute coordinator-owned workspace; Bridge never creates or merges worktrees. task_key/task_mode/write_paths/workspace_mode/base_revision are attribution metadata, not an OS sandbox. model/effort are optional coordinator choices (agy: --model/--effort/--new-project; grok: session/setModel after /new; kimi/cursor/opencode/claude/devin: session/set_config_option after new/resume, devin has no effort; dsh: legacy demo spawn env + respawn on change, native --profile acp session/set_config_option; codex: exec -m / -c model_reasoning_effort, off->none). Pass session_id to continue. Set user_requested=true only when the user explicitly asked for a worker (required in manual mode). Rejected when coordinator.dispatch_enabled is false, even with user_requested=true. For optional retry deduplication, supply a UUID request_id on the first call and replay the same ID and original arguments on retries; keep session_id omitted if it was originally omitted. Adding an ID only on retry cannot deduplicate the first call. Identical retries reuse the task in this Bridge instance while it is retained; different arguments are rejected. Normal dispatch validation still applies. Bindings are lost on restart and are not shared with other instances. Returns immediately."""
+    """Start an external TaskNode turn. cwd is the absolute coordinator-owned workspace; Bridge never creates or merges worktrees. task_key/task_mode/write_paths/workspace_mode/base_revision are attribution metadata, not an OS sandbox. model/effort are optional coordinator choices (agy: --model/--effort/--project (existing project for cwd, else --new-project); grok: session/setModel after /new; kimi/cursor/opencode/claude/devin/zcode/minimax: session/set_config_option after new/resume, devin has no effort; dsh: legacy demo spawn env + respawn on change, native --profile acp session/set_config_option; codex: exec -m / -c model_reasoning_effort, off->none). Pass session_id to continue. Set user_requested=true only when the user explicitly asked for a worker (required in manual mode). Rejected when coordinator.dispatch_enabled is false, even with user_requested=true. For optional retry deduplication, supply a UUID request_id on the first call and replay the same ID and original arguments on retries; keep session_id omitted if it was originally omitted. Adding an ID only on retry cannot deduplicate the first call. Identical retries reuse the task in this Bridge instance while it is retained; different arguments are rejected. Normal dispatch validation still applies. Bindings are lost on restart and are not shared with other instances. Returns immediately."""
     try:
         result = await _registry(ctx).dispatch_task(
             agent=agent,

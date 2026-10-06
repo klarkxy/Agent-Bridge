@@ -1,11 +1,11 @@
 ---
 name: agent-bridge
-description: Coordinate explicitly requested external CLI workers (Grok Build, Kimi Code, Antigravity, DeepSeek Harness, OpenCode, Claude Code, Codex CLI, Devin CLI) through Agent Bridge MCP tools. Use when the user mentions Agent Bridge, dispatch_task, or one of these workers by name, or when an already-defined task-tree leaf is assigned to an external worker. Do not use for ordinary native Codex subagents or generic delegation decisions; in Codex, multi-agent-control:orchestrate owns task-tree construction and native role routing.
+description: Coordinate explicitly requested external CLI workers (Grok Build, Kimi Code, Antigravity, DeepSeek Harness, OpenCode, Claude Code, Codex CLI, Devin CLI, ZCode, MiniMax Code) through Agent Bridge MCP tools. Use when the user mentions Agent Bridge, dispatch_task, or one of these workers by name, or when an already-defined task-tree leaf is assigned to an external worker. Do not use for ordinary native Codex subagents or generic delegation decisions; in Codex, multi-agent-control:orchestrate owns task-tree construction and native role routing.
 ---
 
 # Dispatching workers through Agent Bridge
 
-You are the coordinator: users talk only to you, and you call the workers. Workers are reached **only** through the Agent Bridge MCP tools (`list_agents`, `set_preferences`, `dispatch_task`, `wait_task`, `check_task`, `get_result`, `get_transcript`, `cancel_task`, `list_sessions`, `end_session`). If those tools are missing from this session, stop and say so — never run `grok`, `kimi`, `agy`, `dsh`, `opencode`, `claude`, `claude-agent-acp`, `codex`, or `devin` CLIs directly, and never drive their GUIs. The same product can be a coordinator and a worker; those are different processes.
+You are the coordinator: users talk only to you, and you call the workers. Workers are reached **only** through the Agent Bridge MCP tools (`list_agents`, `set_preferences`, `dispatch_task`, `wait_task`, `check_task`, `get_result`, `get_transcript`, `cancel_task`, `list_sessions`, `end_session`). If those tools are missing from this session, stop and say so — never run `grok`, `kimi`, `agy`, `dsh`, `opencode`, `claude`, `claude-agent-acp`, `codex`, `devin`, `zcode-acp-server`, or `mcode` CLIs directly, and never drive their GUIs. The same product can be a coordinator and a worker; those are different processes.
 
 Provider-native subagents remain allowed inside a worker as an implementation detail. They inherit the assigned leaf's scope and must not receive, discover, or call Agent Bridge, own Git state, or make acceptance decisions.
 
@@ -40,6 +40,8 @@ Examples: "fix the README typo" → yourself. "Add a None check at line 120" →
 - **Claude Code:** optional implementer — user asked, or Grok and Kimi are busy. Worker binary is `claude-agent-acp`.
 - **Codex CLI:** optional implementer — user asked, or others are busy. Desktop-bundled `codex exec`, not the Desktop GUI; startup failures before JSONL are returned in `get_result.error`.
 - **Devin CLI:** optional implementer — user asked, or others are busy. `devin acp`, not Devin Desktop; model ids carry the level (`swe-1-7-medium`), `effort` is ignored with a warning.
+- **ZCode:** optional implementer — user asked, or others are busy. Worker is `zcode-acp-server`, not the ZCode app. Mode is forced to `yolo`.
+- **MiniMax Code:** optional implementer — user asked, or others are busy. `mcode acp`. Permission is forced to `bypassPermissions`.
 - **DeepSeek Harness:** only when others are unavailable or the user asks.
 
 ## The dispatch loop
@@ -52,7 +54,7 @@ Examples: "fix the README typo" → yourself. "Add a None check at line 120" →
    - ZCode: configure `timeoutMs` 600000; otherwise ~15–20 s polls.
    - Grok Build: official default `tool_timeout_sec` is 6000; set 600. If unsure or the host kills the call, ~30–45 s polls.
    - Claude Code: per-server `timeout` 600000 (ms) in `.mcp.json`. CLI default is long; if unsure, ~45 s polls.
-3. `get_result`; while `has_more` is true, call it again with `cursor=next_cursor` and concatenate the pages. Then verify yourself: `git status` / `git diff`, run the relevant build and tests. Never trust the worker's self-report. Grok's real model is `observed_model` (its "I am Grok X" banner is baked at `/new` and does not track model switches). OpenCode and Claude Code `observed_model` / `observed_effort` are the last values Bridge set after mapping, not a live sampler. An empty Kimi result with non-empty `warnings` is a failed turn, not a no-op.
+3. `get_result`; while `has_more` is true, call it again with `cursor=next_cursor` and concatenate the pages. Then verify yourself: `git status` / `git diff`, run the relevant build and tests. Never trust the worker's self-report. Grok's real model is `observed_model` (its "I am Grok X" banner is baked at `/new` and does not track model switches). OpenCode, Claude Code, ZCode, and MiniMax Code `observed_model` / `observed_effort` are the last values Bridge set after mapping, not a live sampler. An empty Kimi result with non-empty `warnings` is a failed turn, not a no-op.
 4. If review fails, make at most one evidence-driven focused retry on the same `session_id`. After that, the coordinator or a native worker takes over; do not keep extending the external lineage.
 5. Summarize the diff, leftover risk, and worker usage. `end_session` when the worker is no longer needed.
 
