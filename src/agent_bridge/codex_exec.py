@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from agent_bridge.native_results import extract_codex_sources
 from agent_bridge.processes import resolve_command
 
 log = logging.getLogger(__name__)
@@ -220,6 +221,7 @@ def build_codex_exec_argv(
     effort: str | None = None,
     resume_id: str | None = None,
     yolo: bool = False,
+    config_overrides: Sequence[str] = (),
 ) -> list[str]:
     cmd = [
         *command,
@@ -240,6 +242,8 @@ def build_codex_exec_argv(
         "-C",
         cwd,
     ]
+    for override in config_overrides:
+        cmd += ["-c", override]
     if model:
         cmd += ["-m", model]
     mapped = codex_effort(effort)
@@ -260,6 +264,7 @@ class CodexTurnState:
         self.turn_completed = False
         self.turn_failed = False
         self.errors: list[str] = []
+        self.sources: list[Any] = []
 
     @property
     def text(self) -> str:
@@ -339,6 +344,8 @@ def apply_codex_event(state: CodexTurnState, obj: Mapping[str, Any]) -> None:
                     path = change.get("path")
                     if isinstance(path, str) and path:
                         state.files.add(path)
+        if item_type == "web_search":
+            extract_codex_sources(item, state.sources)
         return
     if event_type == "turn.completed":
         state.turn_completed = True

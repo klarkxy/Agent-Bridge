@@ -2060,3 +2060,50 @@ async def test_stall_cancel_finishes_after_turn_returns(bridge_home, tmp_path, m
         assert cancel_finished.is_set()
     finally:
         await registry.stop()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_one_flush_waiter_does_not_cancel_the_other(
+    bridge_home, tmp_path, monkeypatch
+):
+    work = tmp_path / "work"
+    work.mkdir()
+    entered = threading.Event()
+    release = threading.Event()
+    block = False
+
+    registry = Registry.create(bridge_home)
+
+    def block_dispatch_write(own):
+        if block:
+            entered.set()
+            assert release.wait(timeout=5)
+        return original_write(own)
+
+    original_write = registry._write_state
+    monkeypatch.setattr(registry, "_write_state", block_dispatch_write)
+    await registry.start()
+    try:
+        block = True
+        first, second = await asyncio.gather(
+            registry.dispatch_task(
+                "fake", "first", cwd=str(work.resolve()), request_id="6e348b4a-3cd2-4a94-84b6-ff53007eea9e",
+            ),
+            registry.dispatch_task(
+                "fake", "second", cwd=str(work.resolve()), request_id="1ca6beac-afd1-4c96-bc65-81b935e47cb7",
+            ),
+        )
+        assert entered.wait(timeout=5)
+        await asyncio.sleep(0)
+        cancel = asyncio.create_task(registry.cancel_task(first["task_id"]))
+        await asyncio.sleep(0)
+        release.set()
+        cancelled = await cancel
+        waited = await registry.wait_task(second["task_id"], timeout_sec=5)
+        assert cancelled["status"] == "cancelled"
+        assert waited["status"] == "completed"
+        assert waited["timed_out"] is False
+        assert registry.tasks[second["task_id"]].cancel_reason != "shutdown"
+    finally:
+        release.set()
+        await registry.stop()

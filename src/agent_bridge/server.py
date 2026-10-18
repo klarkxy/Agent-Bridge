@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server.mcpserver import Context, MCPServer
 from mcp_types import ToolAnnotations
 
+from agent_bridge import capabilities
 from agent_bridge.logging_setup import setup_logging
-from agent_bridge.models import DEFAULT_WAIT_SEC
+from agent_bridge.models import DEFAULT_WAIT_SEC, NativeCapability
 from agent_bridge.paths import ensure_home
 from agent_bridge.registry import RESULT_PAGE_MAX_CHARS, Registry
 
@@ -39,6 +40,9 @@ INSTRUCTIONS = (
     "worker CLIs (Grok, Kimi Code, "
     "Antigravity, DeepSeek Harness, OpenCode, Claude Code, Codex CLI, Devin CLI, Cursor, ZCode, MiniMax Code) and keeps their "
     "sessions resumable.\n"
+    "For direct search/image/video use call_capability and get_capability_result; "
+    "these do not create a coordinator chat or require managing a worker session. "
+    "Generation and input uploads require explicit user authorization. "
     "Hard rules: workers are reached only through these tools — never drive the "
     "worker CLIs or GUIs directly. The top-level coordinator owns routing, Git, "
     "and worktrees. Provider-native subagents may work inside the assigned leaf, "
@@ -133,8 +137,9 @@ async def dispatch_task(
     write_paths: list[str] | None = None,
     workspace_mode: str | None = None,
     base_revision: str | None = None,
+    operation: Literal["image"] | None = None,
 ) -> dict[str, Any]:
-    """Start an external TaskNode turn. cwd is the absolute coordinator-owned workspace; Bridge never creates or merges worktrees. task_key/task_mode/write_paths/workspace_mode/base_revision are attribution metadata, not an OS sandbox. model/effort are optional coordinator choices (agy: --model/--effort/--project (existing project for cwd, else --new-project); grok: session/setModel after /new; kimi/cursor/opencode/claude/devin/zcode/minimax: session/set_config_option after new/resume, devin has no effort; dsh: legacy demo spawn env + respawn on change, native --profile acp session/set_config_option; codex: exec -m / -c model_reasoning_effort, off->none). Pass session_id to continue. Set user_requested=true only when the user explicitly asked for a worker (required in manual mode). Rejected when coordinator.dispatch_enabled is false, even with user_requested=true. For optional retry deduplication, supply a UUID request_id on the first call and replay the same ID and original arguments on retries; keep session_id omitted if it was originally omitted. Adding an ID only on retry cannot deduplicate the first call. Identical retries reuse the task in this Bridge instance while it is retained; different arguments are rejected. Normal dispatch validation still applies. Bindings are lost on restart and are not shared with other instances. Returns immediately."""
+    """Start an external TaskNode turn. cwd is the absolute coordinator-owned workspace; Bridge never creates or merges worktrees. task_key/task_mode/write_paths/workspace_mode/base_revision are attribution metadata, not an OS sandbox. model/effort are optional coordinator choices (agy: --model/--effort/--project (existing project for cwd, else --new-project); grok: session/setModel after /new; kimi/cursor/opencode/claude/devin/zcode/minimax: session/set_config_option after new/resume, devin has no effort; dsh: legacy demo spawn env + respawn on change, native --profile acp session/set_config_option; codex: exec -m / -c model_reasoning_effort, off->none). Pass session_id to continue. Set user_requested=true only when the user explicitly asked for a worker (required in manual mode). Rejected when coordinator.dispatch_enabled is false, even with user_requested=true. For optional retry deduplication, supply a UUID request_id on the first call and replay the same ID and original arguments on retries; keep session_id omitted if it was originally omitted. Adding an ID only on retry cannot deduplicate the first call. Identical retries reuse the task in this Bridge instance while it is retained; different arguments are rejected. Normal dispatch validation still applies. New request bindings survive restart while their tasks are retained; legacy tasks without fingerprints and other live instances are outside this guarantee. This is dispatch deduplication, not provider generation idempotency. operation=image is a fresh Codex app-server image turn; use only with explicit user authorization for that provider and any generation cost. Returns immediately."""
     try:
         result = await _registry(ctx).dispatch_task(
             agent=agent,
@@ -151,6 +156,7 @@ async def dispatch_task(
             write_paths=write_paths,
             workspace_mode=workspace_mode,
             base_revision=base_revision,
+            operation=operation,
         )
         return {"ok": True, **result}
     except Exception as exc:
@@ -159,10 +165,60 @@ async def dispatch_task(
 
 @mcp.tool(annotations=READ_ONLY)
 async def wait_task(ctx: Context, task_id: str, timeout_sec: float = DEFAULT_WAIT_SEC) -> dict[str, Any]:
-    """Wait until a task finishes or timeout_sec elapses (default 180). Timeout is not failure; call wait_task again. Stay under the host MCP tool timeout (Codex tool_timeout_sec, typically 600). Payloads carry silent_for_sec / stall_timeout_sec and files_changed_state (pending, collected, or unavailable)."""
+    """Wait until a task fully finishes, including worker shutdown, or timeout_sec elapses (default 180). Timeout is not failure; call wait_task again. Stay under the host MCP tool timeout (Codex tool_timeout_sec, typically 600). Payloads carry silent_for_sec / stall_timeout_sec and files_changed_state (pending, collected, or unavailable)."""
     try:
         result = await _registry(ctx).wait_task(task_id, timeout_sec=timeout_sec)
         return {"ok": True, **result}
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool()
+async def call_capability(
+    ctx: Context,
+    agent: str,
+    capability: NativeCapability,
+    prompt: str,
+    cwd: str,
+    request_id: str,
+    duration_sec: int | None = None,
+    model: str | None = None,
+    effort: str | None = None,
+    user_requested: bool = False,
+    previous_call_id: str | None = None,
+    input_images: list[str] | None = None,
+) -> dict[str, Any]:
+    """Call one native capability directly, without creating a coordinator chat or managing a worker session. Supported integrations: codex search/image, grok search/image/video, minimax search. Video requires duration_sec; media count is one. Runtime/account/features may still be unavailable. Prompt is text driven: count limits instruct the worker and validate results, not a provider-side tool budget. Use only explicitly authorized generation costs and file uploads. Set user_requested=true for explicit Bridge requests in manual mode. A UUID request_id is required on the FIRST call; replay identical arguments to reuse the retained call, never submit a new generation on failure/uncertainty. Optional previous_call_id continues one completed call from the same agent and workspace; image may continue into video, but video-to-video and image-from-search are rejected. Optional input_images are at most four workspace png/jpeg/webp paths. Search accepts no images. Returns call_id immediately. Read with get_capability_result, cancel with cancel_capability. Provider protocol sessions are internal and closed when finished."""
+    try:
+        return {"ok": True, **await capabilities.call_capability(
+            _registry(ctx), agent=agent, capability=capability, prompt=prompt,
+            cwd=cwd, request_id=request_id, duration_sec=duration_sec,
+            model=model, effort=effort, user_requested=user_requested,
+            previous_call_id=previous_call_id, input_images=input_images,
+        )}
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_capability_result(
+    ctx: Context, call_id: str, wait_sec: float = 0,
+    cursor: int = 0, max_chars: int = RESULT_PAGE_MAX_CHARS,
+) -> dict[str, Any]:
+    """Read or wait up to 60 seconds for a direct capability call. pending=true until the call has fully finished, including worker shutdown; it is not failure. Repeat this read using the SAME call_id. A continuation (previous_call_id) is accepted once pending is false. Returns native sources or verified task-local file metadata, observed model and provider job evidence. Follow next_cursor for long text. Never rerun a generation to recover its result."""
+    try:
+        return {"ok": True, **await capabilities.get_capability_result(
+            _registry(ctx), call_id, wait_sec=wait_sec, cursor=cursor, max_chars=max_chars,
+        )}
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool()
+async def cancel_capability(ctx: Context, call_id: str) -> dict[str, Any]:
+    """Cancel a direct capability call locally. Provider cancellation may be unsupported; a stopped local process does not prove remote generation stopped or that no charge occurred. Preserve uncertain job evidence and never automatically resubmit."""
+    try:
+        return {"ok": True, **await capabilities.cancel_capability(_registry(ctx), call_id)}
     except Exception as exc:
         return _error(exc)
 
@@ -183,7 +239,7 @@ async def get_result(
     cursor: int = 0,
     max_chars: int = RESULT_PAGE_MAX_CHARS,
 ) -> dict[str, Any]:
-    """Return a page of the complete worker result plus changed files, usage, and requested/observed model. Continue with next_cursor while has_more is true. max_chars is capped at 60000. files_changed_state says whether the list/count were collected; files_changed is capped at 200 paths and files_changed_total carries the real count. For Grok, observed_model is the live sampler; the worker saying it is Grok 4.6 is not."""
+    """Return a page of the complete worker result plus changed files, usage, and requested/observed model. Continue with next_cursor while has_more is true. max_chars is capped at 60000. files_changed_state says whether the list/count were collected; files_changed is capped at 200 paths and files_changed_total carries the real count. Optional sources come only from native tool evidence; output_files contain verified task-relative media files, MIME, size and SHA-256. Optional job reports observed media state and explicitly disclaims unsupported remote cancellation. For Grok, observed_model is the live sampler; the worker saying it is Grok 4.6 is not."""
     try:
         return {
             "ok": True,
@@ -223,14 +279,14 @@ async def cancel_task(ctx: Context, task_id: str, reason: str | None = None) -> 
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def list_sessions(ctx: Context, active_only: bool = False) -> dict[str, Any]:
-    """List sessions owned by this Bridge instance and report live siblings."""
+async def list_sessions(ctx: Context, active_only: bool = False, include_internal: bool = False) -> dict[str, Any]:
+    """List sessions owned by this Bridge instance and report live siblings. Capability sessions stay hidden unless include_internal is true, which also reports each session's internal field."""
     try:
         registry = _registry(ctx)
         return {
             "ok": True,
             **(await registry.session_scope()),
-            "sessions": registry.list_sessions(active_only=active_only),
+            "sessions": registry.list_sessions(active_only=active_only, include_internal=include_internal),
         }
     except Exception as exc:
         return _error(exc)

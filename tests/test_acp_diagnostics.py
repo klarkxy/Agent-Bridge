@@ -105,6 +105,42 @@ async def test_handshake_timeout_retains_timeout_type_and_stage(tmp_path, monkey
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("native_id", [None, "native-missing"])
+async def test_strict_resume_does_not_create_or_prompt(tmp_path, monkeypatch, native_id):
+    adapter = _adapter(tmp_path)
+    session = _session(tmp_path)
+    session.native_session_id = native_id
+    spawned = False
+
+    async def fake_spawn(_session):
+        nonlocal spawned
+        spawned = True
+        live = _Live()
+        live.conn = object()
+        adapter._live[_session.session_id] = live
+        return live
+
+    async def fail_load(*_args, **_kwargs):
+        raise RuntimeError("load rejected")
+
+    async def fail_new(*_args, **_kwargs):
+        raise AssertionError("session/new must not run")
+
+    monkeypatch.setattr(adapter, "_spawn", fake_spawn)
+    monkeypatch.setattr(adapter, "_call_load_session", fail_load)
+    monkeypatch.setattr(adapter, "_call_new_session", fail_new)
+    monkeypatch.setattr(adapter, "can_revive", lambda: True)
+    task = Task(
+        task_id="continuation", session_id=session.session_id, agent="cursor",
+        cwd=session.cwd, message="continue", previous_call_id="task_previous",
+    )
+    with pytest.raises(RuntimeError, match=r"could not be resumed|cannot be resumed"):
+        await adapter.run_turn(session, task)
+    assert native_id is not None or not spawned
+    assert session.native_session_id == native_id
+
+
+@pytest.mark.asyncio
 async def test_prompt_failure_is_marked_sent_after_call_starts(tmp_path, monkeypatch):
     adapter = _adapter(tmp_path)
     session = _session(tmp_path)

@@ -117,6 +117,7 @@ class AgentConfig(BaseModel):
     idle_unload_sec: int = 0
     stall_timeout_sec: int = Field(default=1800, ge=0)
     print_timeout: str = "120m"
+    config_overrides: list[str] = Field(default_factory=list)
 
 
 class EnvConfig(BaseModel):

@@ -17,6 +17,7 @@ import psutil
 
 from agent_bridge.adapters import build_adapter
 from agent_bridge.adapters.base import Adapter
+from agent_bridge.capabilities import compose_message, fail_invalid_result, validate_request
 from agent_bridge.config import (
     COORDINATOR_MODE_HINTS,
     AgentConfig,
@@ -31,6 +32,8 @@ from agent_bridge.models import (
     DEFAULT_WAIT_SEC,
     TERMINAL_STATUSES,
     FilesChangedState,
+    NativeCapability,
+    OutputFile,
     ProcState,
     Session,
     Task,
@@ -42,6 +45,8 @@ from agent_bridge.models import (
     normalize_workspace_mode,
     normalize_write_paths,
 )
+from agent_bridge.native_results import checkpoint, load_checkpoint
+from agent_bridge.output_files import checked_path, inspect_media, verify_output
 from agent_bridge.paths import ensure_home, result_path, state_path, transcript_path
 from agent_bridge.persist import (
     atomic_write_json,
@@ -324,7 +329,12 @@ class Registry:
             task = asyncio.create_task(self._flush_state_loop(), name="state-flush")
             self._flush_task = task
         if task is not None and not task.done():
-            await task
+            # Cancelling one waiter must not cancel the shared flush task
+            # other tasks are still awaiting.
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                raise
         if self._pending_state is not None:
             raise RuntimeError("could not persist state.json") from self._state_error
 
@@ -410,6 +420,15 @@ class Registry:
             if self._foreign_live(task.owner_pid, task.owner_create_time):
                 continue
             self._stamp_owner(task)
+            try:
+                load_checkpoint(
+                    self.home, task,
+                    interrupted=task.status in {TaskStatus.queued, TaskStatus.running},
+                )
+            except (OSError, ValueError):
+                task.warnings.append("Native checkpoint could not be validated; no media replay attempted.")
+            self._validate_native_files(task)
+            fail_invalid_result(task)
             if task.status in {TaskStatus.queued, TaskStatus.running}:
                 task.status = TaskStatus.failed
                 task.error = "bridge_restarted"
@@ -424,6 +443,7 @@ class Registry:
             done = asyncio.Event()
             done.set()
             self._done[task.task_id] = done
+        self._mark_legacy_internal_sessions()
         # Stamp adopted owners onto disk first so a following prune is not
         # undone by _merge_owned treating the old unowned rows as foreign.
         self.save()
@@ -489,6 +509,203 @@ class Registry:
             if task.session_id == session_id and task.status in {TaskStatus.queued, TaskStatus.running}:
                 return task
         return None
+
+    def _session_tasks(self, session_id: str) -> list[Task]:
+        return [task for task in self.tasks.values() if task.session_id == session_id]
+
+    def _mark_legacy_internal_sessions(self) -> None:
+        for session in self.sessions.values():
+            if session.internal:
+                continue
+            retained = self._session_tasks(session.session_id)
+            if retained and all(task.capability is not None for task in retained):
+                session.internal = True
+
+    @staticmethod
+    def _dispatch_request(
+        agent: str,
+        message: str,
+        cwd: str,
+        session_id: str | None,
+        model: str | None,
+        effort: str | None,
+        title: str | None,
+        user_requested: bool,
+        task_key: str | None,
+        task_mode: str | None,
+        write_paths: list[str],
+        workspace_mode: str | None,
+        base_revision: str | None,
+        operation: str | None,
+        capability: NativeCapability | None,
+        duration_sec: int | None,
+        previous_call_id: str | None,
+        input_images: tuple[str, ...] | None,
+    ) -> tuple:
+        request = (
+            agent, message, cwd, session_id, model, effort, title, user_requested,
+            task_key, task_mode, tuple(write_paths), workspace_mode, base_revision, operation,
+            capability, duration_sec,
+        )
+        if previous_call_id is not None or input_images is not None:
+            return (*request, previous_call_id, input_images)
+        return request
+
+    def _remember_request(self, request_id: str | None, request: tuple, fingerprint: str) -> dict | None:
+        if request_id is None:
+            return None
+        if request_id not in self._requests:
+            retained = next((
+                task for task in self.tasks.values()
+                if task.request_id == request_id and task.request_fingerprint is not None
+            ), None)
+            if retained is not None:
+                if retained.request_fingerprint != fingerprint:
+                    raise ValueError("request_id is already bound to a different dispatch request")
+                self._requests[request_id] = (request, retained.task_id)
+        if request_id in self._requests:
+            previous, task_id = self._requests[request_id]
+            if previous != request:
+                raise ValueError("request_id is already bound to a different dispatch request")
+            task = self.tasks[task_id]
+            return {
+                "task_id": task.task_id,
+                "session_id": task.session_id,
+                "agent": task.agent,
+                "model": task.model,
+                "effort": task.effort,
+                "request_id": request_id,
+                "task_key": task.task_key,
+                "reused": True,
+            }
+        return None
+
+    @staticmethod
+    def _lexical_reference(cwd: Path, raw: str) -> Path:
+        text = raw.strip()
+        if not text or "://" in text:
+            raise ValueError("reference image paths must stay inside the workspace")
+        candidate = Path(text)
+        if not candidate.is_absolute():
+            candidate = cwd / candidate
+        root = Path(os.path.normpath(os.path.abspath(cwd)))
+        absolute = Path(os.path.normpath(os.path.abspath(candidate)))
+        if ".." in absolute.parts:
+            raise ValueError("reference image path is not workspace-relative")
+        try:
+            relative = absolute.relative_to(root)
+        except ValueError:
+            raise ValueError("reference image is outside the workspace") from None
+        if any(part in {"..", ""} for part in relative.parts):
+            raise ValueError("reference image path is not workspace-relative")
+        return relative
+
+    def _reference_identity(self, cwd: Path, raw: list[str] | None) -> tuple[str, ...] | None:
+        if raw is None:
+            return None
+        if not isinstance(raw, list) or any(not isinstance(item, str) for item in raw):
+            raise ValueError("input_images must be a list of paths")
+        return tuple(self._lexical_reference(cwd, item).as_posix() for item in raw)
+
+    def _normalize_reference_images(self, cwd: Path, raw: list[str] | None) -> list[str]:
+        if not raw:
+            return []
+        if len(raw) > 4:
+            raise ValueError("at most 4 reference images are allowed")
+        root = cwd.resolve()
+        normalized: list[str] = []
+        for item in raw:
+            relative = self._lexical_reference(cwd, item)
+            checked_path(root / relative, root)
+            rendered = relative.as_posix()
+            if rendered not in normalized:
+                normalized.append(rendered)
+        return normalized
+
+    def _reference_metadata(self, cwd: Path, relatives: list[str]) -> list[OutputFile]:
+        root = cwd.resolve()
+        metadata: list[OutputFile] = []
+        for relative in relatives:
+            path = checked_path(root / relative, root)
+            mime, count, digest = inspect_media(path)
+            if not mime.startswith("image/"):
+                raise ValueError("reference images must be png, jpeg, or webp")
+            metadata.append(OutputFile(path=relative, mime=mime, bytes=count, sha256=digest))
+        return metadata
+
+    def _validate_reference_images(self, task: Task) -> None:
+        if not task.input_images:
+            return
+        if len(task.input_image_metadata) != len(task.input_images):
+            raise ValueError("reference image metadata does not match its paths")
+        root = Path(task.cwd).resolve()
+        for relative, recorded in zip(task.input_images, task.input_image_metadata, strict=True):
+            path = checked_path(root / relative, root)
+            mime, count, digest = inspect_media(path)
+            if (relative, mime, count, digest) != (recorded.path, recorded.mime, recorded.bytes, recorded.sha256):
+                raise ValueError("reference image no longer matches its recorded metadata")
+
+    def _continuation_images(self, previous: Task) -> list[str]:
+        images = [
+            output for output in previous.output_files
+            if output.mime.startswith("image/")
+        ]
+        if not images:
+            raise ValueError("the previous capability call has no image output to continue")
+        root = Path(previous.cwd)
+        for output in images:
+            verify_output(output, root, previous.task_id)
+        return [output.path for output in images]
+
+    def _resolve_capability_continuation(
+        self,
+        *,
+        agent: str,
+        cwd: Path,
+        capability: NativeCapability,
+        previous_call_id: str | None,
+        input_images: list[str] | None,
+    ) -> tuple[str | None, list[str], list[OutputFile], str | None]:
+        if capability == "search" and input_images:
+            raise ValueError("search does not accept reference images")
+        supplied = None if input_images is None else self._normalize_reference_images(cwd, input_images)
+        if previous_call_id is None:
+            references = supplied or []
+            return None, references, self._reference_metadata(cwd, references), None
+        previous = self.tasks.get(previous_call_id)
+        if previous is None or previous.capability is None:
+            raise KeyError(f"unknown capability call {previous_call_id}")
+        if previous.status != TaskStatus.completed or previous.task_id not in self._done or not self._done[previous.task_id].is_set():
+            raise ValueError("previous_call_id must refer to a completed capability call")
+        if previous.job is not None and previous.job.status != "completed":
+            raise ValueError("previous_call_id must refer to a fully finished capability call")
+        if previous.agent != agent or Path(previous.cwd).resolve() != cwd.resolve():
+            raise ValueError("continuation must use the same agent and workspace as previous_call_id")
+        if previous.capability != capability and not (previous.capability == "image" and capability == "video"):
+            raise ValueError("this capability cannot continue the previous call")
+        if capability == "video" and previous.capability == "video":
+            raise ValueError("video continuation is unsupported")
+        if capability == "image" and previous.capability == "search":
+            raise ValueError("image continuation from search is unsupported")
+        session = self.sessions.get(previous.session_id)
+        if session is None or not session.internal:
+            raise ValueError("continuation requires the internal session of previous_call_id")
+        lineage = self._session_tasks(session.session_id)
+        if not lineage or lineage[-1].task_id != previous.task_id:
+            raise ValueError("previous_call_id is not the latest call in its session")
+        if self._busy_task(session.session_id) is not None:
+            raise RuntimeError(f"session {session.session_id} is busy; call wait_task first")
+        if not (agent == "codex" and capability == "image") and not session.native_session_id:
+            raise RuntimeError("native session is missing and cannot be resumed")
+        reuse = None if agent == "codex" and capability == "image" else session.session_id
+        if supplied is not None:
+            references = supplied
+        elif capability == "search":
+            references = []
+        else:
+            references = self._continuation_images(previous)
+        metadata = self._reference_metadata(cwd, references)
+        return reuse, references, metadata, previous.task_id
 
     async def list_agents(self) -> list[dict]:
         async def describe(cfg: AgentConfig) -> dict:
@@ -603,6 +820,12 @@ class Registry:
         write_paths: list[str] | None = None,
         workspace_mode: str | None = None,
         base_revision: str | None = None,
+        operation: Literal["image"] | None = None,
+        _capability: NativeCapability | None = None,
+        _capability_duration_sec: int | None = None,
+        _previous_call_id: str | None = None,
+        _input_images: list[str] | None = None,
+        _capability_prompt: str | None = None,
     ) -> dict:
         if not self.dispatch_enabled:
             raise RuntimeError(NESTED_DISPATCH_ERROR)
@@ -634,25 +857,54 @@ class Registry:
             if not base_revision:
                 raise ValueError("base_revision must not be empty")
         self.config.get(agent)
+        if _capability is not None:
+            validate_request(agent, _capability, _capability_duration_sec)
+        if operation is not None and (operation != "image" or agent != "codex"):
+            raise ValueError("operation=image is supported only by Codex")
+        if operation == "image" and session_id is not None:
+            raise ValueError("Codex image operations require a fresh session")
+        if _previous_call_id is not None and _capability is None:
+            raise ValueError("previous_call_id is only valid for a capability call")
+        if _input_images is not None and _capability is None:
+            raise ValueError("input_images are only valid for a capability call")
+        if isinstance(_previous_call_id, str):
+            if not _previous_call_id.strip():
+                raise ValueError("previous_call_id must be a capability call id")
+            _previous_call_id = _previous_call_id.strip()
+        resolved_cwd = str(cwd_path.resolve())
+        identity_error: ValueError | None = None
+        try:
+            image_identity = self._reference_identity(cwd_path, _input_images)
+        except ValueError as exc:
+            image_identity = tuple(_input_images) if isinstance(_input_images, list) else ("",)
+            identity_error = exc
         # Compare supplied arguments, not selections inherited from a mutable session.
-        request = (agent, message, str(cwd_path.resolve()), session_id, model, effort, title, user_requested,
-                   task_key, task_mode, tuple(write_paths), workspace_mode, base_revision)
+        request = self._dispatch_request(
+            agent, message, resolved_cwd, session_id, model, effort, title, user_requested,
+            task_key, task_mode, write_paths, workspace_mode, base_revision, operation,
+            _capability, _capability_duration_sec, _previous_call_id, image_identity,
+        )
+        fingerprint = hashlib.sha256(
+            json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
         async with self._lock:
-            if request_id is not None and request_id in self._requests:
-                previous, task_id = self._requests[request_id]
-                if previous != request:
-                    raise ValueError("request_id is already bound to a different dispatch request")
-                task = self.tasks[task_id]
-                return {
-                    "task_id": task.task_id,
-                    "session_id": task.session_id,
-                    "agent": task.agent,
-                    "model": task.model,
-                    "effort": task.effort,
-                    "request_id": request_id,
-                    "task_key": task.task_key,
-                    "reused": True,
-                }
+            replayed = self._remember_request(request_id, request, fingerprint)
+            if replayed is not None:
+                return replayed
+            if identity_error is not None:
+                raise identity_error
+            references: list[str] = []
+            reference_metadata: list[OutputFile] = []
+            resolved_previous = None
+            if _capability is not None and _capability_prompt is not None:
+                session_id, references, reference_metadata, resolved_previous = self._resolve_capability_continuation(
+                    agent=agent, cwd=cwd_path, capability=_capability,
+                    previous_call_id=_previous_call_id, input_images=_input_images,
+                )
+                message = compose_message(
+                    _capability, _capability_prompt, _capability_duration_sec,
+                    previous_call_id=resolved_previous, input_images=references,
+                )
             if session_id:
                 session = self.sessions.get(session_id)
                 if session is None:
@@ -664,6 +916,8 @@ class Registry:
                         f"session {session.session_id} is bound to {session.cwd}; "
                         "follow-up cwd must be the same project folder"
                     )
+                if session.internal and _capability is None:
+                    raise ValueError("internal capability sessions cannot be used for dispatch_task")
                 busy = self._busy_task(session.session_id)
                 if busy is not None:
                     raise RuntimeError(
@@ -677,6 +931,7 @@ class Registry:
                     model=model,
                     effort=effort,
                     title=title,
+                    internal=_capability is not None,
                     proc_state=ProcState.spawning,
                 )
                 self._stamp_owner(session)
@@ -701,11 +956,18 @@ class Registry:
                 requested_model=model,
                 requested_effort=effort,
                 request_id=request_id,
+                request_fingerprint=fingerprint if request_id is not None else None,
                 task_key=task_key,
                 task_mode=task_mode,
                 write_paths=write_paths,
                 workspace_mode=workspace_mode,
                 base_revision=base_revision,
+                operation=operation,
+                capability=_capability,
+                capability_duration_sec=_capability_duration_sec,
+                previous_call_id=resolved_previous,
+                input_images=references,
+                input_image_metadata=reference_metadata,
                 status=TaskStatus.queued,
             )
             self._stamp_owner(task)
@@ -752,6 +1014,11 @@ class Registry:
             except OSError:
                 log.exception("could not record task start for %s", task_id)
             mark_worker_activity(session.session_id, self.home)
+            if task.request_id is not None or task.operation == "image":
+                # A provider must not see a prompt before the task and retained
+                # request binding exist on disk. This retries metadata only.
+                self.save()
+                await self.flush_state()
             try:
                 before = await asyncio.to_thread(snapshot_workspace, task.cwd)
             except OSError as exc:
@@ -766,11 +1033,19 @@ class Registry:
                 if limit > 0
                 else None
             )
+            if task.capability and task.input_images:
+                self._validate_reference_images(task)
             result = await adapter.run_turn(session, task)
             if result.native_session_id:
                 session.native_session_id = result.native_session_id
             task.result_chars = len(result.text)
             task.warnings.extend(result.warnings)
+            task.sources = result.sources
+            task.output_files = result.output_files
+            task.job = result.job or task.job
+            self._validate_native_files(task)
+            if task.capability:
+                checkpoint(self.home, task)
             reported_paths = normalize_changed_paths(task.cwd, result.files_changed)
             try:
                 atomic_write_text(result_path(task.task_id, self.home), result.text)
@@ -816,9 +1091,10 @@ class Registry:
             # as cancelled; a late turn result must not overwrite that.
             if task.status not in TERMINAL_STATUSES:
                 task.stop_reason = result.stop_reason
-                if result.error:
+                if result.error or (result.stop_reason != "cancelled" and ((task.job and task.job.status in {"failed", "uncertain"}) or task.checkpoint_error)):
                     task.status = TaskStatus.failed
-                    task.error = result.error
+                    task.error = result.error or "Native media delivery or metadata persistence failed; do not resubmit generation."
+                    task.stop_reason = "error"
                     task.error_details = {"stage": "prompt", "category": "worker_error", "prompt_sent": True}
                 elif result.stop_reason == "cancelled":
                     task.status = TaskStatus.cancelled
@@ -839,6 +1115,16 @@ class Registry:
                 task.stop_reason = "error"
                 task.error_details = self._error_details(exc)
         finally:
+            try:
+                load_checkpoint(self.home, task, interrupted=True)
+                self._validate_native_files(task)
+            except (OSError, ValueError):
+                task.warnings.append("Native result recovery failed; do not automatically resubmit media.")
+            if task.status == TaskStatus.completed and (task.checkpoint_error or (task.job and task.job.status in {"failed", "uncertain"})):
+                task.status = TaskStatus.failed
+                task.stop_reason = "error"
+                task.error = "Native media delivery or metadata persistence failed; do not resubmit generation."
+            fail_invalid_result(task)
             if watch is not None:
                 watch.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -877,6 +1163,20 @@ class Registry:
                 flush_session(session.session_id, self.home)
             except OSError:
                 log.exception("could not flush transcript for task %s", task.task_id)
+            if task.capability:
+                cleanup = asyncio.create_task(self.end_session(session.session_id))
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    # stop() may cancel this task while it is already closing
+                    # the worker. Finish that cleanup before signalling done.
+                    try:
+                        await cleanup
+                    except Exception:
+                        log.exception("capability worker shutdown failed for %s", task_id)
+                except Exception as exc:
+                    task.warnings.append(f"Capability worker shutdown failed: {type(exc).__name__}")
+                    log.exception("capability worker shutdown failed for %s", task_id)
             self._done[task_id].set()
             self._bg.pop(task_id, None)
             self.save()
@@ -893,7 +1193,8 @@ class Registry:
                 task.stop_reason,
                 (task.error or "")[:500],
             )
-            self._schedule_idle(session.session_id)
+            if not task.capability:
+                self._schedule_idle(session.session_id)
 
     @staticmethod
     def _set_files_changed(task: Task, paths: list[str], provenance: dict[str, str] | None = None) -> None:
@@ -1182,6 +1483,14 @@ class Registry:
             ),
             "progress": progress,
         }
+        if task.sources:
+            payload["sources"] = [s.model_dump(mode="json", exclude_none=True) for s in task.sources]
+        if task.output_files:
+            payload["output_files"] = [f.model_dump(mode="json", exclude_none=True) for f in task.output_files]
+        if task.job:
+            payload["job"] = task.job.model_dump(mode="json", exclude_none=True)
+        if task.operation:
+            payload["operation"] = task.operation
         if task.started_at:
             start = datetime.fromisoformat(task.started_at)
             end = datetime.fromisoformat(task.finished_at) if task.finished_at else datetime.fromisoformat(iso())
@@ -1210,9 +1519,9 @@ class Registry:
         return payload
 
     async def wait_task(self, task_id: str, timeout_sec: float = DEFAULT_WAIT_SEC) -> dict:
-        task = self._require_task(task_id)
+        self._require_task(task_id)
         event = self._done.setdefault(task_id, asyncio.Event())
-        if task.status not in TERMINAL_STATUSES:
+        if not event.is_set():
             try:
                 await asyncio.wait_for(event.wait(), timeout=timeout_sec)
             except TimeoutError:
@@ -1266,6 +1575,27 @@ class Registry:
         )
         return payload
 
+    def _validate_native_files(self, task: Task) -> None:
+        valid = []
+        for output in task.output_files[:16]:
+            try:
+                verify_output(output, Path(task.cwd), task.task_id)
+                valid.append(output)
+            except (OSError, ValueError):
+                if "Delivered media failed file verification." not in task.warnings:
+                    task.warnings.append("Delivered media failed file verification.")
+                if task.job:
+                    task.job.status = "failed"
+                    task.job.reason = "Local file verification failed; generation must not be resubmitted."
+        if len(valid) < len(task.output_files):
+            task.error = "Delivered media failed file verification."
+            if task.status == TaskStatus.completed:
+                task.status = TaskStatus.failed
+                task.stop_reason = "error"
+        task.output_files = valid
+        if task.job or task.output_files:
+            checkpoint(self.home, task)
+
     def get_transcript(
         self, session_id: str, offset: int = 0, limit: int = 50,
         kinds: list[str] | None = None, task_id: str | None = None,
@@ -1316,25 +1646,28 @@ class Registry:
             self.save()
         return self._task_snapshot(self.tasks[task_id])
 
-    def list_sessions(self, active_only: bool = False) -> list[dict]:
+    def list_sessions(self, active_only: bool = False, include_internal: bool = False) -> list[dict]:
         rows = []
         for session in self.sessions.values():
+            if session.internal and not include_internal:
+                continue
             if active_only and session.proc_state in {ProcState.dead, ProcState.idle_unloaded}:
                 continue
-            rows.append(
-                {
-                    "session_id": session.session_id,
-                    "agent": session.agent,
-                    "cwd": session.cwd,
-                    "native_session_id": session.native_session_id,
-                    "proc_state": session.proc_state.value,
-                    "turns": session.turns,
-                    "title": session.title,
-                    "model": session.model,
-                    "effort": session.effort,
-                    "last_active_at": session.last_active_at,
-                }
-            )
+            row = {
+                "session_id": session.session_id,
+                "agent": session.agent,
+                "cwd": session.cwd,
+                "native_session_id": session.native_session_id,
+                "proc_state": session.proc_state.value,
+                "turns": session.turns,
+                "title": session.title,
+                "model": session.model,
+                "effort": session.effort,
+                "last_active_at": session.last_active_at,
+            }
+            if include_internal:
+                row["internal"] = session.internal
+            rows.append(row)
         return rows
 
     async def session_scope(self) -> dict:
@@ -1352,9 +1685,10 @@ class Registry:
         busy = self._busy_task(session_id)
         if busy is not None:
             await self.cancel_task(busy.task_id, reason="session_end")
-        adapter = self._adapters.pop(session_id, None)
+        adapter = self._adapters.get(session_id)
         if adapter is not None:
             await adapter.shutdown(session)
+            self._adapters.pop(session_id, None)
         self._cancel_idle(session_id)
         forget_worker_activity(session_id, self.home)
         session.proc_state = ProcState.dead

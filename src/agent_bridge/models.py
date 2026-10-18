@@ -4,7 +4,7 @@ import re
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -41,6 +41,7 @@ class ProcState(StrEnum):
 
 TERMINAL_STATUSES = {TaskStatus.completed, TaskStatus.failed, TaskStatus.cancelled}
 DEFAULT_WAIT_SEC = 180.0
+NativeCapability = Literal["search", "image", "video"]
 EFFORTS = ("off", "low", "medium", "high", "max")
 WORKSPACE_MODES = ("shared", "patch_only", "worktree")
 _TASK_KEY = re.compile(r"^[a-z0-9][a-z0-9._/-]{0,127}$")
@@ -150,6 +151,7 @@ class Session(BaseModel):
     agent: str
     cwd: str
     native_session_id: str | None = None
+    internal: bool = False
     proc_state: ProcState = ProcState.idle_unloaded
     model: str | None = None
     effort: str | None = None
@@ -164,6 +166,32 @@ class Session(BaseModel):
     owner_create_time: float | None = None
 
 
+class SourceReference(BaseModel):
+    title: str
+    url: str
+    snippet: str | None = None
+    tool_call_id: str | None = None
+
+
+class OutputFile(BaseModel):
+    path: str
+    mime: str
+    bytes: int = Field(gt=0)
+    sha256: str
+    tool_call_id: str | None = None
+
+
+class ProviderJob(BaseModel):
+    provider: str
+    task_id: str | None = None
+    native_session_id: str | None = None
+    native_turn_id: str | None = None
+    status: Literal["submitted", "running", "completed", "failed", "uncertain"]
+    submitted_at: str | None = None
+    remote_cancel_supported: bool = False
+    reason: str | None = None
+
+
 class Task(BaseModel):
     task_id: str
     session_id: str
@@ -175,11 +203,19 @@ class Task(BaseModel):
     requested_model: str | None = None
     requested_effort: str | None = None
     request_id: str | None = None
+    request_fingerprint: str | None = None
     task_key: str | None = None
     task_mode: str | None = None
     write_paths: list[str] = Field(default_factory=list)
     workspace_mode: str | None = None
     base_revision: str | None = None
+    operation: Literal["image"] | None = None
+    capability: NativeCapability | None = None
+    capability_duration_sec: int | None = None
+    previous_call_id: str | None = None
+    input_images: list[str] = Field(default_factory=list)
+    input_image_metadata: list[OutputFile] = Field(default_factory=list)
+    native_calls: dict[str, str] = Field(default_factory=dict)
     observed_model: str | None = None
     observed_effort: str | None = None
     status: TaskStatus = TaskStatus.queued
@@ -194,6 +230,10 @@ class Task(BaseModel):
     # another writer's change when the cwd is shared.
     files_changed_provenance: dict[str, str] = Field(default_factory=dict)
     usage: dict[str, Any] = Field(default_factory=dict)
+    sources: list[SourceReference] = Field(default_factory=list)
+    output_files: list[OutputFile] = Field(default_factory=list)
+    job: ProviderJob | None = None
+    checkpoint_error: bool = False
     error: str | None = None
     error_details: dict[str, Any] | None = None
     cancel_reason: str | None = None
@@ -219,6 +259,9 @@ class TurnResult(BaseModel):
     native_session_id: str | None = None
     error: str | None = None
     warnings: list[str] = Field(default_factory=list)
+    sources: list[SourceReference] = Field(default_factory=list)
+    output_files: list[OutputFile] = Field(default_factory=list)
+    job: ProviderJob | None = None
     # Last model/effort the adapter successfully applied this turn. Grok and
     # Kimi observers in Registry overwrite these with on-disk sampler truth.
     observed_model: str | None = None
